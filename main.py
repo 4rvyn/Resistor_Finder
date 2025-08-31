@@ -13,6 +13,13 @@ import heapq
 import bisect
 import traceback
 
+import mmap
+import math
+import os
+import struct
+from array import array
+
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QLineEdit, QComboBox, QSpinBox,
@@ -70,6 +77,227 @@ def _get_deviation_color(perc_dev, max_dev):
     blue = 0
     return f'#{red:02x}{green:02x}{blue:02x}'
 
+
+
+# ===========================
+# Precompute loader & helpers
+# ===========================
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSET_FILES = {
+    'E12': os.path.join(ROOT_DIR, 'assets', 'rcf_e12.bin'),
+    'E24': os.path.join(ROOT_DIR, 'assets', 'rcf_e24.bin'),
+    'E96': os.path.join(ROOT_DIR, 'assets', 'rcf_e96.bin'),
+}
+
+
+# Fixed-point scales used when generating the binaries
+R_SCALE = 10**8    # integer units per ohm for R-arrays
+G_SCALE = 10**12   # integer units per siemens for G-arrays
+
+# Header layout used by the generator/validator we built earlier.
+# Fields (little-endian):
+#   magic[4] = b'RCF1'
+#   version  = u32 (1)
+#   nSingles = u32 (n)
+#   nPairs   = u32 (m)
+#   off_R, off_G, off_mant, off_dec, off_S_sum, off_S_i, off_S_j, off_G_sum, off_G_i, off_G_j = 10 * u64
+#   payload_crc32 = u32  (CRC of everything after the header)
+_HEADER_FMT = '<4sIII' + 'Q'*10 + 'I'
+_HEADER_SIZE = struct.calcsize(_HEADER_FMT)
+
+class Precomp:
+    __slots__ = ('path', 'n', 'm',
+                 'R', 'G', 'mant', 'dec',
+                 'S_sum', 'S_i', 'S_j',
+                 'P_sum', 'P_i', 'P_j')
+    def __init__(self): pass
+
+_PRECOMP_CACHE = {}  # keyed by series 'E12'/'E24'/'E96'
+
+def _read_array(f, off, count, code):
+    """Read a numeric array from offset using array('code')."""
+    if count == 0:
+        return array(code)
+    bps = array(code).itemsize
+    f.seek(off)
+    buf = f.read(count * bps)
+    a = array(code)
+    a.frombytes(buf)
+    if sys.byteorder != 'little':
+        a.byteswap()
+    return a
+
+def load_precomp(series: str, log):
+    """
+    Load precompute container created by precomp.py.
+    Returns an object with typed memoryviews into the mmapped file, e.g.:
+      H.R, H.G, H.mant, H.dec, H.S_sum, H.S_i, H.S_j, H.G_sum, H.G_i, H.G_j
+    Plus metadata: H.n, H.m, H.scale_R, H.scale_G, etc.
+    """
+    path = ASSET_FILES.get(series)
+    if not path:
+        raise ValueError(f"Unknown E-series '{series}'")
+    log(f"  Opening precompute: {path}", level=1)
+
+    f = open(path, 'rb')
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+
+    # Header is little-endian; layout must match precomp.py::pack_header
+    # Fixed part (through scales):
+    # <4s I B B b b H I Q Q Q Q Q Q
+    hdr_fixed_fmt = "<4s I B B b b H I Q Q Q Q Q Q"
+    hdr_fixed_size = struct.calcsize(hdr_fixed_fmt)
+    if len(mm) < hdr_fixed_size:
+        mm.close(); f.close()
+        raise ValueError("Precompute file too small to contain fixed header")
+
+    hdr_fixed = struct.unpack_from(hdr_fixed_fmt, mm, 0)
+    magic, version, endian_flag, e_series_id, dec_min, dec_max, _pad0, \
+        n_singles, n_pairs_series, n_pairs_parallel, \
+        R_SCALE_NUM, R_SCALE_DEN, G_SCALE_NUM, G_SCALE_DEN = hdr_fixed
+
+    # === checks ===
+    if magic != b"RCF\x00":
+        mm.close(); f.close()
+        raise ValueError(
+            f"Bad magic in precompute file (got {magic!r}) at {path}. "
+            f"Expected b'RCF\\x00'."
+        )
+    if version != 1:
+        mm.close(); f.close()
+        raise ValueError(f"Unsupported precompute version {version} (expected 1)")
+    if endian_flag != 0:
+        mm.close(); f.close()
+        raise ValueError("Only little-endian payloads are supported (endian_flag != 0)")
+    expected_id = {'E12':12, 'E24':24, 'E96':96}[series]
+    if e_series_id != expected_id:
+        mm.close(); f.close()
+        raise ValueError(f"E-series id mismatch: file={e_series_id}, requested {expected_id}")
+
+    # Offsets/lengths for 10 arrays (offset,len) pairs
+    names = [
+        "R","G","mantissa_idx","decade",
+        "S_sum","S_i","S_j",
+        "G_sum","G_i","G_j"
+    ]
+    pairs_fmt = "<" + "QQ"*len(names)
+    pairs_size = struct.calcsize(pairs_fmt)
+    pairs_off = hdr_fixed_size
+    if len(mm) < pairs_off + pairs_size + 8:  # +8 for checksum
+        mm.close(); f.close()
+        raise ValueError("Precompute file too small to contain array offset table")
+
+    pairs_vals = struct.unpack_from(pairs_fmt, mm, pairs_off)
+    offsets = {}
+    for i, nm in enumerate(names):
+        off = pairs_vals[2*i+0]
+        ln  = pairs_vals[2*i+1]
+        offsets[nm] = (off, ln)
+
+    # payload checksum (we don't recompute here; precompval.py already did)
+    checksum = struct.unpack_from("<Q", mm, pairs_off + pairs_size)[0]
+
+    # Helper to create typed memoryviews (no copies)
+    mv = memoryview(mm)
+
+    def view_q(off, count):  # int64
+        if off == 0 or count == 0: return None
+        b = mv[off: off + count*8]
+        return b.cast('q')
+
+    def view_Q(off, count):  # uint64 (not used here, but for symmetry)
+        if off == 0 or count == 0: return None
+        b = mv[off: off + count*8]
+        return b.cast('Q')
+
+    def view_I(off, count):  # uint32
+        if off == 0 or count == 0: return None
+        b = mv[off: off + count*4]
+        return b.cast('I')
+
+    def view_H(off, count):  # uint16
+        if off == 0 or count == 0: return None
+        b = mv[off: off + count*2]
+        return b.cast('H')
+
+    def view_b(off, count):  # int8
+        if off == 0 or count == 0: return None
+        b = mv[off: off + count*1]
+        return b.cast('b')
+
+    # Build the holder object
+    class Holder: pass
+    H = Holder()
+    H.mm = mm
+    H.f = f  # (optional) file handle; mm keeps mapping alive regardless
+    H.path = path
+
+    H.n = n_singles
+    H.m_series = n_pairs_series
+    H.m_parallel = n_pairs_parallel
+    H.decade_min = dec_min
+    H.decade_max = dec_max
+
+    # Scales (as floats for convenience)
+    H.scale_R = (R_SCALE_NUM, R_SCALE_DEN)
+    H.scale_G = (G_SCALE_NUM, G_SCALE_DEN)
+    H.R_units_per_ohm = R_SCALE_NUM / R_SCALE_DEN     # 1e8
+    H.G_units_per_S   = G_SCALE_NUM / G_SCALE_DEN     # 1e12 (pS)
+
+    # Views
+    off,len_ = offsets["R"];             H.R = view_q(off, len_)
+    off,len_ = offsets["G"];             H.G = view_q(off, len_)
+    off,len_ = offsets["mantissa_idx"];  H.mant = view_H(off, len_)
+    off,len_ = offsets["decade"];        H.dec = view_b(off, len_)
+
+    off,len_ = offsets["S_sum"];         H.S_sum = view_q(off, len_)
+    off,len_ = offsets["S_i"];           H.S_i   = view_I(off, len_)
+    off,len_ = offsets["S_j"];           H.S_j   = view_I(off, len_)
+
+    off,len_ = offsets["G_sum"];         H.G_sum = view_q(off, len_)
+    off,len_ = offsets["G_i"];           H.G_i   = view_I(off, len_)
+    off,len_ = offsets["G_j"];           H.G_j   = view_I(off, len_)
+
+
+    off,len_ = offsets["G_sum"];         H.G_sum = view_q(off, len_)
+    off,len_ = offsets["G_i"];           H.G_i   = view_I(off, len_)
+    off,len_ = offsets["G_j"];           H.G_j   = view_I(off, len_)
+
+    # Back-compat aliases so the search code can use P_* for parallel (conductance)
+    H.P_sum = H.G_sum
+    H.P_i   = H.G_i
+    H.P_j   = H.G_j
+
+
+    # Quick sanity (optional)
+    if H.R is None or len(H.R) != H.n:
+        mm.close(); f.close()
+        raise ValueError("R array missing or length mismatch")
+    if H.G is None or len(H.G) != H.n:
+        mm.close(); f.close()
+        raise ValueError("G array missing or length mismatch")
+
+    return H
+
+
+# ---------- integer math helpers ----------
+def ceil_div_pos(a, b):  # a,b > 0
+    return (a + b - 1) // b
+
+def band_on_sorted(arr, lo, hi):
+    """Return [l, r) indices such that lo <= arr[idx] <= hi; arr is nondecreasing."""
+    l = bisect.bisect_left(arr, lo)
+    r = bisect.bisect_right(arr, hi)
+    if r < l: r = l
+    return l, r
+
+def build_allowed(dec_arr, dec_lo, dec_hi):
+    """Boolean mask of singles allowed by decade range inclusive."""
+    return [ (dec_lo <= d <= dec_hi) for d in dec_arr ]
+
+
+
 # --- Core Calculation Logic ---
 def find_resistor_combinations(
     target_value,
@@ -87,319 +315,315 @@ def find_resistor_combinations(
     start_time = time.time()
     results = []
 
-    closest_fits_heap = []
-    MAX_CLOSEST_FITS = 10
-    tie_breaker_counter = 0
-    found_combinations_keys = set()
-
-    # Dedicated logger function for structured output
+    # dedicated logger
     def log(message, level=0):
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
         indent = "  " * level
-        formatted_message = f"[{timestamp}] {indent}{message}"
-        queue_func(formatted_message)
+        queue_func(f"[{timestamp}] {indent}{message}")
 
     try:
-        # --- HELPER FUNCTIONS ---
-        def get_canonical_key(config, r1, r2, r3):
-            resistors = sorted([r for r in [r1, r2, r3] if r is not None])
-            if config == "Mixed S-P":
-                sub_resistors = sorted([r for r in [r2, r3] if r is not None])
-                return (config, r1, tuple(sub_resistors))
-            elif config == "Mixed P-S":
-                sub_resistors = sorted([r for r in [r2, r3] if r is not None])
-                return (config, r1, tuple(sub_resistors))
-            return (config, tuple(resistors))
-
-        def _check_and_store_combination(combined_r, config, topology, r1, r2, r3):
-            nonlocal tie_breaker_counter
-            if combined_r is None or combined_r <= 0 or combined_r == float('inf'): return
-            canonical_key = get_canonical_key(config, r1, r2, r3)
-            if canonical_key in found_combinations_keys: return
-            abs_dev, perc_dev = calculate_deviation(combined_r, target_value)
-            is_within_tolerance = perc_dev <= allowed_deviation_percent
-            is_close_enough_for_heap = len(closest_fits_heap) < MAX_CLOSEST_FITS or abs_dev < -closest_fits_heap[0][0]
-            if not is_within_tolerance and not is_close_enough_for_heap: return
-            found_combinations_keys.add(canonical_key)
-            result_item = {
-                "config": config, "topology": topology, "r1": r1, "r2": r2, "r3": r3,
-                "combined_r": combined_r, "abs_dev": abs_dev, "perc_dev": perc_dev
-            }
-            if is_within_tolerance: results.append(result_item)
-            if is_close_enough_for_heap:
-                heap_tuple = (-abs_dev, tie_breaker_counter, result_item)
-                tie_breaker_counter += 1
-                if len(closest_fits_heap) < MAX_CLOSEST_FITS:
-                    heapq.heappush(closest_fits_heap, heap_tuple)
-                else:
-                    heapq.heapreplace(closest_fits_heap, heap_tuple)
-
-        def generate_e_series_resistors(base_vals, min_factor, max_factor):
-            resistors = set()
-            if min_factor > max_factor: return []
-            for factor_exponent in range(min_factor, max_factor + 1):
-                if stop_event.is_set(): raise InterruptedError("Calculation stopped.")
-                multiplier = 10**factor_exponent
-                for base_val in base_vals:
-                    resistors.add(round(base_val * multiplier, 8))
-            return sorted(list(resistors))
-
-        def calculate_deviation(calculated_value, target_val):
-            if target_val <= 0: return float('inf'), float('inf')
-            if calculated_value == float('inf'): return float('inf'), float('inf')
-            absolute_deviation = abs(calculated_value - target_val)
-            percentage_deviation = (absolute_deviation / target_val) * 100.0
-            return absolute_deviation, percentage_deviation
-
-        def find_closest(data, value):
-            if not data or value <= 0: return
-            SEARCH_WIDTH = 10 # Number of elements to search around the target value
-            pos = bisect.bisect_left(data, value)
-            start = max(0, pos - SEARCH_WIDTH)
-            end = min(len(data), pos + SEARCH_WIDTH)
-            for i in range(start, end):
-                yield data[i]
-
-        # --- SETUP AND PRE-COMPUTATION ---
+        # ================
+        # LOAD PRECOMPUTE
+        # ================
         log("[SETUP]")
-        log(f"Target: {format_resistor_value(target_value)}", level=1)
-        log(f"Tolerance: {allowed_deviation_percent:.3f}%", level=1)
-        log(f"Max Components: {max_components}", level=1)
-        log(f"E-Series: {selected_e_series}", level=1)
-        log(f"Range: 10^{range_min_factor} to 10^{range_max_factor}", level=1)
-        config_parts = []
-        if series_allowed: config_parts.append("Series")
-        if parallel_allowed: config_parts.append("Parallel")
-        if mixed_allowed: config_parts.append("Mixed")
-        log(f"Configurations Allowed: {', '.join(config_parts) if config_parts else 'None'}", level=1)
+        log(f"E-Series: {selected_e_series}", 1)
+        H = load_precomp(selected_e_series, log)
 
-        if selected_e_series == 'E12': base_values = E12_BASE_VALUES
-        elif selected_e_series == 'E24': base_values = E24_BASE_VALUES
-        elif selected_e_series == 'E96': base_values = E96_BASE_VALUES
-        else:
-            log(f"Error: Invalid E-Series '{selected_e_series}'.", level=1)
-            return None, 0
+        # Build decade filter
+        dec_lo = int(range_min_factor); dec_hi = int(range_max_factor)
+        allowed = build_allowed(H.dec, dec_lo, dec_hi)
 
-        available_resistors = generate_e_series_resistors(base_values, range_min_factor, range_max_factor)
-        if stop_event.is_set(): raise InterruptedError("Calculation stopped.")
-        if not available_resistors:
-            log(f"No {selected_e_series} resistors generated in the specified range. Exiting.", level=1)
+        # Convert UI target & tolerance → integer bands
+        tol = allowed_deviation_percent / 100.0
+        T_min = target_value * (1.0 - tol)
+        T_max = target_value * (1.0 + tol)
+
+        # Scaled bands
+        R_min = int(math.ceil(T_min * R_SCALE))
+        R_max = int(math.floor(T_max * R_SCALE))
+        # For parallel: conductance band  [G_min, G_max]
+        if T_max <= 0 or T_min <= 0:
             return [], 0
+        G_min = int(math.ceil(G_SCALE / T_max))
+        G_max = int(math.floor(G_SCALE / T_min))
 
-        num_available = len(available_resistors)
-        log(f"Generated {num_available} unique {selected_e_series} values for searching.", level=1)
+        log(f"Target: {format_resistor_value(target_value)}", 1)
+        log(f"Tolerance: {allowed_deviation_percent:.6f}%", 1)
+        log(f"Decades allowed: 10^{dec_lo} .. 10^{dec_hi}", 1)
 
-        # how many of the resistor values are <= or > the target
-        num_le_target = bisect.bisect_right(available_resistors, target_value)
-        num_gt_target = num_available - num_le_target    # strictly greater than target
-
-
-        upper_bound = target_value * (1 + allowed_deviation_percent / 100.0)
-        series_candidates = [r for r in available_resistors if r <= upper_bound]
-        num_series_cand = len(series_candidates)
-        log(f"Filtered to {num_series_cand} candidates for series combinations.", level=1)
-
-
-
-        # --- PROGRESS BAR ESTIMATION ---------------------------------
-        total_steps = 0
-        steps_done  = 0
-
-        # ------- N = 1 -----------------------------------------------
-        if max_components >= 1:
-            total_steps += num_available                         # every single R1
-
-        # ------- N = 2 -----------------------------------------------
-        if max_components >= 2:
-            if series_allowed:
-                # we report once for each R1 that can pair with some R2
-                total_steps += sum(1 for r in series_candidates if r <= target_value)
-            if parallel_allowed:
-                # we report once for every R1 that is > target (R1||R2)
-                total_steps += num_gt_target
-
-        # ------- N = 3 -----------------------------------------------
-        if max_components >= 3:
-            if series_allowed:
-                # count all (R1, R2) pairs where R1 + R2 ≤ target
-                total_s3 = 0
-                for r1 in series_candidates:
-                    rem = target_value - r1
-                    if rem < 0:
-                        continue
-                    total_s3 += bisect.bisect_right(series_candidates, rem)
-                total_steps += total_s3
-
-            if parallel_allowed:
-                # every R1 > target combined with every possible R2
-                total_steps += num_gt_target * num_available
-
-            if mixed_allowed:
-                # ---------- Mixed S-P :  R1 + (R2||R3) ---------------
-                total_sp = 0
-                for r1 in available_resistors:
-                    tp = target_value - r1
-                    if tp <= 0:
-                        continue
-                    idx = bisect.bisect_right(available_resistors, tp)   # R2 must be > tp
-                    total_sp += (num_available - idx)
-                total_steps += total_sp
-
-                # ---------- Mixed P-S :  R1 || (R2+R3) ---------------
-                total_ps = 0
-                for r1 in available_resistors:
-                    if r1 <= target_value:
-                        continue
-                    try:
-                        ts = 1.0 / (1.0 / target_value - 1.0 / r1)
-                    except (ZeroDivisionError, ValueError):
-                        continue
-                    if ts < 0:
-                        continue
-                    idx = bisect.bisect_right(available_resistors, ts)   # R2 ≤ ts
-                    total_ps += idx
-                total_steps += total_ps
-
-
-
-
-
-
-        log(f"Estimated main loop iterations: {total_steps:,}", level=1)
-
-        # Define the reporter function
-        update_interval = max(1, total_steps // 200) if total_steps > 0 else 1
-
-        def report_progress():
+        # progress bookkeeping (rough but monotone)
+        total_steps = 1
+        steps_done = 0
+        def bump(n=1):
             nonlocal steps_done
-            steps_done += 1
-            if steps_done % update_interval == 0:
-                queue_func({'type': 'progress', 'current': steps_done, 'total': total_steps})
-                if stop_event.is_set(): raise InterruptedError("Calculation stopped by user.")
+            steps_done += n
+            if steps_done % 200 == 0:
+                queue_func({'type':'progress', 'current': steps_done, 'total': max(total_steps, steps_done)})
 
-        # --- TARGETED SEARCH LOOPS WITH PROGRESS REPORTING ---
-        log("") # Blank line for spacing
-        log("[SEARCHING]")
+        # Small helpers to emit results
+        def emit_single(k):
+            r1 = H.R[k] / R_SCALE
+            combined = r1
+            abs_dev = abs(combined - target_value)
+            perc_dev = (abs_dev / target_value) * 100.0
+            results.append({
+                'config': 'Single',
+                'topology': 'R1',
+                'r1': r1, 'r2': None, 'r3': None,
+                'combined_r': combined,
+                'abs_dev': abs_dev,
+                'perc_dev': perc_dev
+            })
+
+        def emit_series2(i,j):
+            r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE
+            combined = r1 + r2
+            abs_dev = abs(combined - target_value)
+            perc_dev = (abs_dev / target_value) * 100.0
+            results.append({
+                'config': 'Series (2)', 'topology': 'R1+R2',
+                'r1': r1, 'r2': r2, 'r3': None,
+                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
+            })
+
+        def emit_parallel2(i,j):
+            gsum = H.G[i] + H.G[j]
+            if gsum <= 0: return
+            combined = (G_SCALE / gsum)
+            r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE
+            abs_dev = abs(combined - target_value)
+            perc_dev = (abs_dev / target_value) * 100.0
+            results.append({
+                'config': 'Parallel (2)', 'topology': 'R1||R2',
+                'r1': r1, 'r2': r2, 'r3': None,
+                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
+            })
+
+        def emit_series3(i,j,k):
+            r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE; r3 = H.R[k] / R_SCALE
+            combined = r1 + r2 + r3
+            abs_dev = abs(combined - target_value)
+            perc_dev = (abs_dev / target_value) * 100.0
+            results.append({
+                'config': 'Series (3)', 'topology': 'R1+R2+R3',
+                'r1': r1, 'r2': r2, 'r3': r3,
+                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
+            })
+
+        def emit_parallel3(i,j,k):
+            gsum = H.G[i] + H.G[j] + H.G[k]
+            if gsum <= 0: return
+            combined = (G_SCALE / gsum)
+            r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE; r3 = H.R[k] / R_SCALE
+            abs_dev = abs(combined - target_value)
+            perc_dev = (abs_dev / target_value) * 100.0
+            results.append({
+                'config': 'Parallel (3)', 'topology': 'R1||R2||R3',
+                'r1': r1, 'r2': r2, 'r3': r3,
+                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
+            })
+
+        def emit_mixed_SP(i,j,k):
+            # R1 + (R2||R3)
+            gsum = H.G[i] + H.G[j]
+            if gsum <= 0: return
+            r_par = (G_SCALE / gsum)
+            r1 = H.R[k] / R_SCALE
+            combined = r1 + r_par
+            r2 = H.R[i] / R_SCALE; r3 = H.R[j] / R_SCALE
+            abs_dev = abs(combined - target_value)
+            perc_dev = (abs_dev / target_value) * 100.0
+            results.append({
+                'config': 'Mixed S-P', 'topology': 'R1+(R2||R3)',
+                'r1': r1, 'r2': r2, 'r3': r3,
+                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
+            })
+
+        def emit_mixed_PS(i,j,k):
+            # R1 || (R2+R3)
+            ssum = H.R[i] + H.R[j]
+            denom = (H.R[k] + ssum)
+            if denom <= 0: return
+            # compute in float for display
+            r1 = H.R[k] / R_SCALE; s = ssum / R_SCALE
+            combined = (r1 * s) / (r1 + s)
+            r2 = H.R[i] / R_SCALE; r3 = H.R[j] / R_SCALE
+            abs_dev = abs(combined - target_value)
+            perc_dev = (abs_dev / target_value) * 100.0
+            results.append({
+                'config': 'Mixed P-S', 'topology': 'R1||(R2+R3)',
+                'r1': r1, 'r2': r2, 'r3': r3,
+                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
+            })
+
+        # ==========================
+        # N=1 (band on singles R[])
+        # ==========================
+        log("[SEARCHING]", 0)
         if max_components >= 1:
-            log("Checking single resistors (N=1)...", level=1)
-            for r1 in available_resistors:
-                _check_and_store_combination(r1, "Single", "R1", r1, None, None)
-                report_progress()
-        if stop_event.is_set(): raise InterruptedError("Calculation stopped.")
+            l, r = band_on_sorted(H.R, R_min, R_max)
+            total_steps += (r - l)
+            log(f"Singles band: {r-l} candidates", 1)
+            for k in range(l, r):
+                if stop_event.is_set(): raise InterruptedError()
+                if allowed[k]:
+                    emit_single(k)
+                bump()
 
+        # ==========================
+        # N=2 (Series / Parallel)
+        # ==========================
         if max_components >= 2:
             if series_allowed:
-                log("Checking series combinations (N=2)...", level=1)
-                for r1 in series_candidates:
-                    r2_ideal = target_value - r1
-                    if r2_ideal < 0: continue
-                    for r2 in find_closest(series_candidates, r2_ideal):
-                        _check_and_store_combination(r1 + r2, "Series (2)", "R1+R2", r1, r2, None)
-                    report_progress()
-            if stop_event.is_set(): raise InterruptedError("Calculation stopped.")
-            if parallel_allowed:
-                log("Checking parallel combinations (N=2)...", level=1)
-                for r1 in available_resistors:
-                    if r1 <= target_value: continue
-                    try: r2_ideal = 1.0 / (1.0/target_value - 1.0/r1)
-                    except (ZeroDivisionError, ValueError): continue
-                    if r2_ideal < 0: continue
-                    for r2 in find_closest(available_resistors, r2_ideal):
-                        _check_and_store_combination(parallel_calc(r1, r2), "Parallel (2)", "R1||R2", r1, r2, None)
-                    report_progress()
-            if stop_event.is_set(): raise InterruptedError("Calculation stopped.")
+                l, r = band_on_sorted(H.S_sum, R_min, R_max)
+                total_steps += (r - l)
+                log(f"Series(2) band: {r-l} pairs", 1)
+                for idx in range(l, r):
+                    if stop_event.is_set(): raise InterruptedError()
+                    i = H.S_i[idx]; j = H.S_j[idx]
+                    if allowed[i] and allowed[j]:
+                        emit_series2(i, j)
+                    bump()
 
+            if parallel_allowed:
+                l, r = band_on_sorted(H.P_sum, G_min, G_max)
+                total_steps += (r - l)
+                log(f"Parallel(2) band: {r-l} pairs", 1)
+                for idx in range(l, r):
+                    if stop_event.is_set(): raise InterruptedError()
+                    i = H.P_i[idx]; j = H.P_j[idx]
+                    if allowed[i] and allowed[j]:
+                        emit_parallel2(i, j)
+                    bump()
+
+        # ==========================================
+        # N=3 (Series, Parallel, Mixed S-P, Mixed P-S)
+        # ==========================================
         if max_components >= 3:
+            # Precompute list of allowed singles to loop outer k
+            allowed_indices = [k for k in range(H.n) if allowed[k]]
+
             if series_allowed:
-                log("Checking series combinations (N=3)...", level=1)
-                for r1 in series_candidates:
-                    for r2 in series_candidates:
-                        r3_ideal = target_value - r1 - r2
-                        if r3_ideal < 0: continue
-                        for r3 in find_closest(series_candidates, r3_ideal):
-                            _check_and_store_combination(r1 + r2 + r3, "Series (3)", "R1+R2+R3", r1, r2, r3)
-                        report_progress()
-            if stop_event.is_set(): raise InterruptedError("Calculation stopped.")
+                log("Series(3): scanning per-k windows over S_sum ...", 1)
+                for k in allowed_indices:
+                    if stop_event.is_set(): raise InterruptedError()
+                    Rk = H.R[k]
+                    lo = R_min - Rk
+                    hi = R_max - Rk
+                    if hi < lo: 
+                        continue
+                    l, r = band_on_sorted(H.S_sum, lo, hi)
+                    total_steps += (r - l)
+                    for idx in range(l, r):
+                        i = H.S_i[idx]; j = H.S_j[idx]
+                        # de-dup: ensure the outer k is >= j (emit each unordered triple once)
+                        if not (allowed[i] and allowed[j]): 
+                            continue
+                        if j > k:
+                            continue
+                        emit_series3(i, j, k)
+                    bump()
+
             if parallel_allowed:
-                log("Checking parallel combinations (N=3)...", level=1)
-                for r1 in available_resistors:
-                    if r1 <= target_value: continue
-                    for r2 in available_resistors:
-                        try: r3_ideal = 1.0 / (1.0/target_value - 1.0/r1 - 1.0/r2)
-                        except (ZeroDivisionError, ValueError): continue
-                        if r3_ideal < 0: continue
-                        for r3 in find_closest(available_resistors, r3_ideal):
-                            _check_and_store_combination(parallel_calc(r1, r2, r3), "Parallel (3)", "R1||R2||R3", r1, r2, r3)
-                        report_progress()
-            if stop_event.is_set(): raise InterruptedError("Calculation stopped.")
+                log("Parallel(3): scanning per-k windows over P_sum ...", 1)
+                for k in allowed_indices:
+                    if stop_event.is_set(): raise InterruptedError()
+                    Gk = H.G[k]
+                    lo = G_min - Gk
+                    hi = G_max - Gk
+                    if hi < lo:
+                        continue
+                    l, r = band_on_sorted(H.P_sum, lo, hi)
+                    total_steps += (r - l)
+                    for idx in range(l, r):
+                        i = H.P_i[idx]; j = H.P_j[idx]
+                        if not (allowed[i] and allowed[j]):
+                            continue
+                        if j > k:
+                            continue
+                        emit_parallel3(i, j, k)
+                    bump()
+
             if mixed_allowed:
-                log("Checking mixed S-P combinations: R1 + (R2||R3)...", level=1)
-                for r1 in available_resistors:
-                    target_parallel = target_value - r1
-                    if target_parallel <= 0: continue
-                    for r2 in available_resistors:
-                        if r2 <= target_parallel: continue
-                        try: r3_ideal = 1.0 / (1.0/target_parallel - 1.0/r2)
-                        except (ZeroDivisionError, ValueError): continue
-                        if r3_ideal < 0: continue
-                        for r3 in find_closest(available_resistors, r3_ideal):
-                            _check_and_store_combination(r1 + parallel_calc(r2, r3), "Mixed S-P", "R1+(R2||R3)", r1, r2, r3)
-                        report_progress()
-                if stop_event.is_set(): raise InterruptedError("Calculation stopped.")
+                # Mixed S-P : R1 + (R2||R3)  → for each R1 use a G_sum window derived from R-band
+                log("Mixed S-P: per-k G_sum windows derived from R-band ...", 1)
+                for k in allowed_indices:
+                    if stop_event.is_set(): raise InterruptedError()
+                    r1_ohm = H.R[k] / R_SCALE
+                    # Desired parallel branch must satisfy: r_par ∈ [T_min - r1, T_max - r1]
+                    tp_min_ohm = T_min - r1_ohm
+                    tp_max_ohm = T_max - r1_ohm
+                    # If the parallel part must be positive, clip the lower bound slightly above 0
+                    if tp_max_ohm <= 0:
+                        continue
+                    if tp_min_ohm <= 0:
+                        tp_min_ohm = 1e-12  # avoid div-by-zero; any tiny positive number is fine
 
-                log("Checking mixed P-S combinations: R1 || (R2+R3)...", level=1)
-                for r1 in available_resistors:
-                    if r1 <= target_value: continue
-                    try: target_series = 1.0 / (1.0/target_value - 1.0/r1)
-                    except (ZeroDivisionError, ValueError): continue
-                    if target_series < 0: continue
-                    for r2 in available_resistors:
-                        if r2 > target_series: break
-                        r3_ideal = target_series - r2
-                        if r3_ideal < 0: continue
-                        for r3 in find_closest(available_resistors, r3_ideal):
-                             _check_and_store_combination(parallel_calc(r1, r2 + r3), "Mixed P-S", "R1||(R2+R3)", r1, r2, r3)
-                        report_progress()
-            if stop_event.is_set(): raise InterruptedError("Calculation stopped.")
+                    # Convert resistance window → conductance window in pS
+                    gL = int(math.ceil(G_SCALE / tp_max_ohm))   # lower conductance bound
+                    gU = int(math.floor(G_SCALE / tp_min_ohm))  # upper conductance bound
+                    if gU < gL:
+                        continue
 
-        # --- FINAL PROCESSING ---
-        queue_func({'type': 'progress', 'current': steps_done, 'total': steps_done})
-        log("") # Blank line for spacing
+                    l, r = band_on_sorted(H.P_sum, gL, gU)
+
+                    total_steps += (r - l)
+                    for idx in range(l, r):
+                        i = H.P_i[idx]; j = H.P_j[idx]
+                        if allowed[i] and allowed[j]:
+                            emit_mixed_SP(i, j, k)
+                    bump()
+
+                # Mixed P-S : R1 || (R2+R3)  → feasible only if R1 > R_max
+                log("Mixed P-S: per-k S_sum windows derived from parallel algebra ...", 1)
+                for k in allowed_indices:
+                    if stop_event.is_set(): raise InterruptedError()
+                    R1 = H.R[k]
+                    if R1 <= R_max:
+                        continue
+                    # S in [S_min, S_max] where:
+                    # S_min = ceil( R_min*R1 / (R1 - R_min) )
+                    # S_max = floor( R_max*R1 / (R1 - R_max) )
+                    # All integer in R_SCALE domain:
+                    S_min_num = R_min * R1
+                    S_min_den = (R1 - R_min)
+                    if S_min_den <= 0:
+                        continue
+                    S_min = ceil_div_pos(S_min_num, S_min_den)
+
+                    S_max_num = R_max * R1
+                    S_max_den = (R1 - R_max)
+                    if S_max_den <= 0:
+                        continue
+                    S_max = S_max_num // S_max_den
+
+                    if S_max < S_min:
+                        continue
+                    l, r = band_on_sorted(H.S_sum, S_min, S_max)
+                    total_steps += (r - l)
+                    for idx in range(l, r):
+                        i = H.S_i[idx]; j = H.S_j[idx]
+                        if allowed[i] and allowed[j]:
+                            emit_mixed_PS(i, j, k)
+                    bump()
+
+        # wrap up
+        queue_func({'type':'progress', 'current': steps_done, 'total': max(total_steps, steps_done)})
         log("[SUMMARY]")
+        log(f"Found {len(results)} combinations within tolerance.", 1)
+        log(f"Total time: {time.time() - start_time:.3f} s", 1)
+        return results, max(total_steps, steps_done)
 
-        if not results:
-            log("No combinations found within the specified tolerance.", level=1)
-            if closest_fits_heap:
-                final_closest_fits = {}
-                sorted_heap = sorted(closest_fits_heap, key=lambda x: x[0], reverse=True)
-                for _, _, item in sorted_heap:
-                    key = get_canonical_key(item['config'], item['r1'], item['r2'], item['r3'])
-                    if key not in final_closest_fits: final_closest_fits[key] = item
-                closest_results_list = list(final_closest_fits.values())
-                closest_results_list.sort(key=lambda x: x['abs_dev'])
-                log(f"Providing the {len(closest_results_list)} closest unique combinations found:", level=2)
-                results = closest_results_list
-            else:
-                log("No close alternatives were found.", level=2)
-
-        end_time = time.time()
-        log("Calculation finished.", level=1)
-        log(f"Total time: {end_time - start_time:.3f} seconds.", level=1)
-        return results, total_steps
-
-    except InterruptedError as ie:
-        log(f"\n[USER STOP]", 0)
-        log(f"Calculation stopped by user.", 1)
-        queue_func({'type': 'progress', 'current': steps_done, 'total': total_steps, 'status': 'Stopped'})
-        return None, total_steps
+    except InterruptedError:
+        queue_func({'type':'progress', 'current': 1, 'total': 1, 'status':'Stopped'})
+        return None, 0
     except Exception as e:
-        log(f"\n[CALCULATION ERROR]", 0)
-        log(f"An unexpected error occurred: {e}", 1)
-        tb_lines = traceback.format_exc().splitlines()
-        for line in tb_lines:
-            log(line, level=2)
-        queue_func({'type': 'progress', 'current': steps_done, 'total': total_steps, 'status': 'Error'})
-        return None, total_steps
+        queue_func({'type':'progress', 'current': 1, 'total': 1, 'status':'Error'})
+        tb = traceback.format_exc()
+        log("[CALCULATION ERROR] " + str(e), 0)
+        for line in tb.splitlines():
+            log(line, 1)
+        return None, 0
 
 
 # --- Qt Worker for Calculations ---
