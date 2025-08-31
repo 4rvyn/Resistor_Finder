@@ -5,17 +5,18 @@
 ##################################################################################
 
 import sys
-import math
-import itertools
 import time
 import html
 import datetime
+
+import heapq
+import bisect
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QLineEdit, QComboBox, QSpinBox,
     QCheckBox, QPushButton, QTextEdit, QFrame, QGroupBox,
-    QDialog, QMessageBox, QSplitter
+    QDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QFont, QTextCursor
@@ -38,8 +39,6 @@ CONFIG_COLORS = {
 E12_BASE_VALUES = [1.0, 1.2, 1.5, 1.8, 2.2, 2.7, 3.3, 3.9, 4.7, 5.6, 6.8, 8.2]
 E24_BASE_VALUES = [1.0, 1.1, 1.2, 1.3, 1.5, 1.6, 1.8, 2.0, 2.2, 2.4, 2.7, 3.0, 3.3, 3.6, 3.9, 4.3, 4.7, 5.1, 5.6, 6.2, 6.8, 7.5, 8.2, 9.1]
 E96_BASE_VALUES = [1.00, 1.02, 1.05, 1.07, 1.10, 1.13, 1.15, 1.18, 1.21, 1.24, 1.27, 1.30, 1.33, 1.37, 1.40, 1.43, 1.47, 1.50, 1.54, 1.58, 1.62, 1.65, 1.69, 1.74, 1.78, 1.82, 1.87, 1.91, 1.96, 2.00, 2.05, 2.10, 2.15, 2.21, 2.26, 2.32, 2.37, 2.43, 2.49, 2.55, 2.61, 2.67, 2.74, 2.80, 2.87, 2.94, 3.01, 3.09, 3.16, 3.24, 3.32, 3.40, 3.48, 3.57, 3.65, 3.74, 3.83, 3.92, 4.02, 4.12, 4.22, 4.32, 4.42, 4.53, 4.64, 4.75, 4.87, 4.99, 5.11, 5.23, 5.36, 5.49, 5.62, 5.76, 5.90, 6.04, 6.19, 6.34, 6.49, 6.65, 6.81, 6.98, 7.15, 7.32, 7.50, 7.68, 7.87, 8.06, 8.25, 8.45, 8.66, 8.87, 9.09, 9.31, 9.53, 9.76]
-
-PRACTICALITY_RATIO_THRESHOLD = 1000.0
 
 # --- Helper Functions ---
 def format_resistor_value(r_value):
@@ -70,60 +69,6 @@ def _get_deviation_color(perc_dev, max_dev):
     blue = 0
     return f'#{red:02x}{green:02x}{blue:02x}'
 
-# --- Helper Function for Practicality Check ---
-def is_combination_practical(r1_param, r2_param, r3_param, config_type, threshold=PRACTICALITY_RATIO_THRESHOLD):
-    if config_type == "Single":
-        return True
-    if config_type == "Series (2)":
-        if r1_param is None or r2_param is None or r1_param <= 0 or r2_param <= 0: return True
-        if max(r1_param, r2_param) / min(r1_param, r2_param) > threshold: return False
-        return True
-    if config_type == "Parallel (2)":
-        if r1_param is None or r2_param is None or r1_param <= 0 or r2_param <= 0: return True
-        if max(r1_param, r2_param) / min(r1_param, r2_param) > threshold: return False
-        return True
-    if config_type == "Series (3)":
-        if r1_param is None or r2_param is None or r3_param is None or \
-           r1_param <= 0 or r2_param <= 0 or r3_param <= 0: return True
-        actual_resistors = [r1_param, r2_param, r3_param]
-        for i in range(3):
-            r_i = actual_resistors[i]
-            others_sum = sum(r for j, r in enumerate(actual_resistors) if i != j)
-            if others_sum <= 0: continue
-            if others_sum / r_i > threshold: return False
-        return True
-    if config_type == "Parallel (3)":
-        if r1_param is None or r2_param is None or r3_param is None or \
-           r1_param <= 0 or r2_param <= 0 or r3_param <= 0: return True
-        actual_resistors = [r1_param, r2_param, r3_param]
-        for i in range(3):
-            r_i = actual_resistors[i]
-            others_for_parallel_calc = [r for j, r in enumerate(actual_resistors) if i != j]
-            if not others_for_parallel_calc or len(others_for_parallel_calc) < 2 : continue # Should not happen if 3 resistors are passed
-            r_others_parallel = parallel_calc(others_for_parallel_calc[0], others_for_parallel_calc[1])
-            if r_others_parallel <= 0 or r_others_parallel == float('inf'): continue
-            if r_i / r_others_parallel > threshold: return False
-        return True
-    if config_type == "Mixed S-P":
-        if r1_param is None or r2_param is None or r3_param is None or \
-           r1_param <= 0 or r2_param <= 0 or r3_param <= 0: return True
-        R_series = r1_param; R_sub_P1 = r2_param; R_sub_P2 = r3_param
-        if max(R_sub_P1, R_sub_P2) / min(R_sub_P1, R_sub_P2) > threshold: return False
-        R_par_val = parallel_calc(R_sub_P1, R_sub_P2)
-        if R_par_val <= 0 or R_par_val == float('inf'): return True
-        if max(R_series, R_par_val) / min(R_series, R_par_val) > threshold: return False
-        return True
-    if config_type == "Mixed P-S":
-        if r1_param is None or r2_param is None or r3_param is None or \
-           r1_param <= 0 or r2_param <= 0 or r3_param <= 0: return True
-        R_parallel = r1_param; R_sub_S1 = r2_param; R_sub_S2 = r3_param
-        if max(R_sub_S1, R_sub_S2) / min(R_sub_S1, R_sub_S2) > threshold: return False
-        R_ser_val = R_sub_S1 + R_sub_S2
-        if R_ser_val <=0: return True
-        if max(R_parallel, R_ser_val) / min(R_parallel, R_ser_val) > threshold: return False
-        return True
-    return True
-
 # --- Core Calculation Logic ---
 def find_resistor_combinations(
     target_value,
@@ -135,14 +80,11 @@ def find_resistor_combinations(
     series_allowed,
     parallel_allowed,
     mixed_allowed,
-    apply_practicality_filter,
     stop_event,
     queue_func
 ):
     start_time = time.time()
     results = []
-    import heapq
-    import bisect
 
     closest_fits_heap = []
     MAX_CLOSEST_FITS = 10
@@ -173,7 +115,6 @@ def find_resistor_combinations(
             if combined_r is None or combined_r <= 0 or combined_r == float('inf'): return
             canonical_key = get_canonical_key(config, r1, r2, r3)
             if canonical_key in found_combinations_keys: return
-            if apply_practicality_filter and not is_combination_practical(r1, r2, r3, config): return
             abs_dev, perc_dev = calculate_deviation(combined_r, target_value)
             is_within_tolerance = perc_dev <= allowed_deviation_percent
             is_close_enough_for_heap = len(closest_fits_heap) < MAX_CLOSEST_FITS or abs_dev < -closest_fits_heap[0][0]
@@ -230,7 +171,6 @@ def find_resistor_combinations(
         if parallel_allowed: config_parts.append("Parallel")
         if mixed_allowed: config_parts.append("Mixed")
         log(f"Configurations Allowed: {', '.join(config_parts) if config_parts else 'None'}", level=1)
-        log(f"Practicality Filter: {'ON' if apply_practicality_filter else 'OFF'}", level=1)
 
         if selected_e_series == 'E12': base_values = E12_BASE_VALUES
         elif selected_e_series == 'E24': base_values = E24_BASE_VALUES
@@ -439,7 +379,7 @@ def find_resistor_combinations(
                 log(f"Providing the {len(closest_results_list)} closest unique combinations found:", level=2)
                 results = closest_results_list
             else:
-                log("No practical combinations were found to suggest as close alternatives.", level=2)
+                log("No close alternatives were found.", level=2)
 
         end_time = time.time()
         log("Calculation finished.", level=1)
@@ -468,9 +408,9 @@ class CalculationWorker(QObject):
     text_output_signal = pyqtSignal(str)
     calculation_finished_signal = pyqtSignal(object, int)
 
-    def __init__(self, *args_for_calc_func_with_filter_flag):
+    def __init__(self, *calc_args):
         super().__init__()
-        self.args_for_calc_func = args_for_calc_func_with_filter_flag
+        self.args_for_calc_func = calc_args
 
     def run_calculation(self):
         class StopEventChecker:
@@ -520,7 +460,6 @@ class ResistorCalculatorApp(QMainWindow):
         self._default_series_allowed = True
         self._default_parallel_allowed = True
         self._default_mixed_allowed = True
-        self._default_practicality_filter_enabled = True
 
         self._setup_ui()
         self._connect_signals()
@@ -627,10 +566,7 @@ class ResistorCalculatorApp(QMainWindow):
         sort_group_box.setLayout(sort_layout)
         control_grid_layout.addWidget(sort_group_box, row_num, 0, 1, 3)
         row_num += 1
-        self.practicality_filter_check = QCheckBox("Filter Impractical Combinations")
-        self.practicality_filter_check.setChecked(self._default_practicality_filter_enabled)
-        control_grid_layout.addWidget(self.practicality_filter_check, row_num, 0, 1, 3)
-        row_num +=1
+
         control_grid_layout.setRowStretch(row_num, 1)
         control_main_v_layout.addStretch(1)
         self.help_button = QPushButton("Help?")
@@ -683,7 +619,6 @@ class ResistorCalculatorApp(QMainWindow):
             self.parallel_check, self.mixed_check,
             self.unit_combo, self.eseries_combo,
             self.help_button,
-            self.practicality_filter_check
         ]
         self.run_button.setEnabled(not is_running)
         self.stop_button.setEnabled(is_running)
@@ -773,7 +708,6 @@ class ResistorCalculatorApp(QMainWindow):
             series_allowed = self.series_check.isChecked()
             parallel_allowed = self.parallel_check.isChecked()
             mixed_allowed = self.mixed_check.isChecked() and (max_comp >= 3)
-            apply_practicality_filter_flag = self.practicality_filter_check.isChecked()
 
             if deviation < 0: raise ValueError("Deviation cannot be negative.")
             if target_val_part <= 0: raise ValueError("Target value must be positive.")
@@ -793,8 +727,7 @@ class ResistorCalculatorApp(QMainWindow):
             self.calculation_qthread = QThread()
             worker_args = (
                 target_value_ohms, deviation, max_comp, e_series, range_min,
-                range_max, series_allowed, parallel_allowed, mixed_allowed,
-                apply_practicality_filter_flag
+                range_max, series_allowed, parallel_allowed, mixed_allowed
             )
             self.worker = CalculationWorker(*worker_args)
             self.worker.moveToThread(self.calculation_qthread)
