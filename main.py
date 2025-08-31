@@ -11,6 +11,7 @@ import datetime
 
 import heapq
 import bisect
+import traceback
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -394,7 +395,6 @@ def find_resistor_combinations(
     except Exception as e:
         log(f"\n[CALCULATION ERROR]", 0)
         log(f"An unexpected error occurred: {e}", 1)
-        import traceback
         tb_lines = traceback.format_exc().splitlines()
         for line in tb_lines:
             log(line, level=2)
@@ -746,7 +746,7 @@ class ResistorCalculatorApp(QMainWindow):
             self._update_button_states(is_running=False)
         except Exception as e:
             self._log_gui_event(f"GUI ERROR: {e}")
-            import traceback; self._log_gui_event(traceback.format_exc())
+            self._log_gui_event(traceback.format_exc())
             self.progress_label.setText("GUI Error")
             self._update_button_states(is_running=False)
 
