@@ -1,24 +1,21 @@
 ##################################################################################
 # Author:    Arvin Parvizinia
-# Date:      2025-05-16
-# Version:   1.0
+# Date:      01.09.2025
+# Version:   2.0
 ##################################################################################
 
 import sys
 import time
 import html
 import datetime
-
 import heapq
 import bisect
 import traceback
-
 import mmap
 import math
 import os
 import struct
 from array import array
-
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -77,8 +74,6 @@ def _get_deviation_color(perc_dev, max_dev):
     blue = 0
     return f'#{red:02x}{green:02x}{blue:02x}'
 
-
-
 # ===========================
 # Precompute loader & helpers
 # ===========================
@@ -89,7 +84,6 @@ ASSET_FILES = {
     'E24': os.path.join(ROOT_DIR, 'assets', 'rcf_e24.bin'),
     'E96': os.path.join(ROOT_DIR, 'assets', 'rcf_e96.bin'),
 }
-
 
 # Fixed-point scales used when generating the binaries
 R_SCALE = 10**8    # integer units per ohm for R-arrays
@@ -195,7 +189,7 @@ def load_precomp(series: str, log):
         ln  = pairs_vals[2*i+1]
         offsets[nm] = (off, ln)
 
-    # payload checksum (we don't recompute here; precompval.py already did)
+    # payload checksum
     checksum = struct.unpack_from("<Q", mm, pairs_off + pairs_size)[0]
 
     # Helper to create typed memoryviews (no copies)
@@ -206,7 +200,7 @@ def load_precomp(series: str, log):
         b = mv[off: off + count*8]
         return b.cast('q')
 
-    def view_Q(off, count):  # uint64 (not used here, but for symmetry)
+    def view_Q(off, count):  # uint64 (not used, but for symmetry)
         if off == 0 or count == 0: return None
         b = mv[off: off + count*8]
         return b.cast('Q')
@@ -230,7 +224,7 @@ def load_precomp(series: str, log):
     class Holder: pass
     H = Holder()
     H.mm = mm
-    H.f = f  # (optional) file handle; mm keeps mapping alive regardless
+    H.f = f  # file handle; mm keeps mapping alive regardless
     H.path = path
 
     H.n = n_singles
@@ -269,8 +263,7 @@ def load_precomp(series: str, log):
     H.P_i   = H.G_i
     H.P_j   = H.G_j
 
-
-    # Quick sanity (optional)
+    # Quick sanity bianry checks
     if H.R is None or len(H.R) != H.n:
         mm.close(); f.close()
         raise ValueError("R array missing or length mismatch")
@@ -279,7 +272,6 @@ def load_precomp(series: str, log):
         raise ValueError("G array missing or length mismatch")
 
     return H
-
 
 # ---------- integer math helpers ----------
 def ceil_div_pos(a, b):  # a,b > 0
@@ -296,9 +288,7 @@ def build_allowed(dec_arr, dec_lo, dec_hi):
     """Boolean mask of singles allowed by decade range inclusive."""
     return [ (dec_lo <= d <= dec_hi) for d in dec_arr ]
 
-
-
-# --- Core Calculation Logic ---
+# --- Core Calculation Logic: CORE A ---
 def find_resistor_combinations(
     target_value,
     allowed_deviation_percent,
@@ -312,6 +302,14 @@ def find_resistor_combinations(
     stop_event,
     queue_func
 ):
+    """
+    Path A: Complete enumeration within a specified tolerance band.
+    Uses the precomputed singles + pair tables to exhaustively generate
+    every valid resistor combination that falls within ±allowed_deviation_percent
+    of target_value.
+    Respects: E-series, decade range, component count, and configuration options.
+    Guarantees: full coverage across tolerance band.
+    """
     start_time = time.time()
     results = []
 
@@ -625,7 +623,7 @@ def find_resistor_combinations(
             log(line, 1)
         return None, 0
 
-
+# --- Core Calculation Logic: CORE B ---
 def find_resistor_combinations_topk(
     target_value,
     _unused_allowed_deviation_percent,
@@ -645,6 +643,7 @@ def find_resistor_combinations_topk(
     Uses the precomputed singles + pair tables. Produces exactly K best items
     by absolute deviation from target_value and then stops.
     Respects: E-series, decade range, max_components, allowed configs.
+    Guarantees: *exact global Top-K* results by true deviation; optimized for speed.
     """
     start_time = time.time()
     results = []
@@ -1019,8 +1018,6 @@ def find_resistor_combinations_topk(
             log(line, 1)
         return None, 0
 
-
-
 # --- Qt Worker for Calculations ---
 class CalculationWorker(QObject):
     progress_updated = pyqtSignal(int, int, str)
@@ -1066,7 +1063,6 @@ class CalculationWorker(QObject):
         self.calculation_finished_signal.emit(results, total_checks)
 
 
-
 # --- Qt6 GUI Application ---
 class ResistorCalculatorApp(QMainWindow):
     def __init__(self):
@@ -1084,6 +1080,7 @@ class ResistorCalculatorApp(QMainWindow):
         self.last_used_deviation_limit = 0.1
         self.estimated_total_checks = 0
         self.help_dialog = None
+        self._last_core_mode = 'A'
 
         # --- Default control values ---
         self._default_max_components = 3
@@ -1152,7 +1149,6 @@ class ResistorCalculatorApp(QMainWindow):
         control_grid_layout.addWidget(self.kbest_spin, row_num, 1, 1, 2)
         row_num += 1
 
-        
         control_grid_layout.addWidget(QLabel("Max Components (N):"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
         self.max_comp_spin = QSpinBox()
         self.max_comp_spin.setRange(1, 3)
@@ -1249,7 +1245,6 @@ class ResistorCalculatorApp(QMainWindow):
         # Initialize core-specific enable/disable
         self._update_core_ui()
 
-
     def _connect_signals(self):
         self.run_button.clicked.connect(self.start_calculation)
         self.stop_button.clicked.connect(self.stop_calculation)
@@ -1258,9 +1253,7 @@ class ResistorCalculatorApp(QMainWindow):
         self.sort_config_button.clicked.connect(lambda: self.sort_by_config(display_message=True))
         self.help_button.clicked.connect(self.show_help_window)
         self.max_comp_spin.valueChanged.connect(self._update_mixed_check_state)
-
         self.core_combo.currentIndexChanged.connect(self._on_core_changed)
-
 
     def _update_mixed_check_state(self):
         is_n_less_than_3 = self.max_comp_spin.value() < 3
@@ -1277,7 +1270,6 @@ class ResistorCalculatorApp(QMainWindow):
         self.deviation_entry.setEnabled(not path_b)
         self.kbest_spin.setEnabled(path_b)
 
-
     def _update_button_states(self, is_running):
         widgets_to_disable_during_run = [
             self.target_entry, self.deviation_entry, self.max_comp_spin,
@@ -1285,6 +1277,8 @@ class ResistorCalculatorApp(QMainWindow):
             self.parallel_check, self.mixed_check,
             self.unit_combo, self.eseries_combo,
             self.help_button,
+            self.core_combo,
+            self.kbest_spin,
         ]
         self.run_button.setEnabled(not is_running)
         self.stop_button.setEnabled(is_running)
@@ -1389,7 +1383,6 @@ class ResistorCalculatorApp(QMainWindow):
             elif target_unit == f"G{OHM_SYMBOL}": target_value_ohms = target_val_part * 1000000000
             else: target_value_ohms = target_val_part
 
-
             # --- choose core & start worker ---
             core_mode = 'A' if self.core_combo.currentIndex() == 0 else 'B'
             self._last_core_mode = core_mode  # remember for sorting behavior after finish
@@ -1418,8 +1411,6 @@ class ResistorCalculatorApp(QMainWindow):
             self.calculation_qthread.finished.connect(self._on_thread_actually_finished)
             self.calculation_qthread.start()
 
-
-
         except ValueError as ve:
             self._log_gui_event(f"INPUT ERROR: {ve}")
             self.progress_label.setText("Input Error")
@@ -1439,7 +1430,11 @@ class ResistorCalculatorApp(QMainWindow):
         self.estimated_total_checks = total_checks_from_worker
         if results is not None:
             self.current_results = results
-            self.sort_by_config(display_message=False) # Default sort
+            if getattr(self, '_last_core_mode', 'A') == 'B':
+                self.sort_by_deviation(display_message=False)
+            else:
+                self.sort_by_config(display_message=False)
+
             self.append_text_to_output("__DISPLAY_RESULTS__")
             self._log_gui_event(f"Calculation finished. {len(self.current_results)} total combinations found.")
         else:
