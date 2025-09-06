@@ -40,11 +40,6 @@ CONFIG_COLORS = {
     "default": "#000000"      # Black for any unexpected case
 }
 
-# --- E-Series Definitions ---
-E12_BASE_VALUES = [1.0, 1.2, 1.5, 1.8, 2.2, 2.7, 3.3, 3.9, 4.7, 5.6, 6.8, 8.2]
-E24_BASE_VALUES = [1.0, 1.1, 1.2, 1.3, 1.5, 1.6, 1.8, 2.0, 2.2, 2.4, 2.7, 3.0, 3.3, 3.6, 3.9, 4.3, 4.7, 5.1, 5.6, 6.2, 6.8, 7.5, 8.2, 9.1]
-E96_BASE_VALUES = [1.00, 1.02, 1.05, 1.07, 1.10, 1.13, 1.15, 1.18, 1.21, 1.24, 1.27, 1.30, 1.33, 1.37, 1.40, 1.43, 1.47, 1.50, 1.54, 1.58, 1.62, 1.65, 1.69, 1.74, 1.78, 1.82, 1.87, 1.91, 1.96, 2.00, 2.05, 2.10, 2.15, 2.21, 2.26, 2.32, 2.37, 2.43, 2.49, 2.55, 2.61, 2.67, 2.74, 2.80, 2.87, 2.94, 3.01, 3.09, 3.16, 3.24, 3.32, 3.40, 3.48, 3.57, 3.65, 3.74, 3.83, 3.92, 4.02, 4.12, 4.22, 4.32, 4.42, 4.53, 4.64, 4.75, 4.87, 4.99, 5.11, 5.23, 5.36, 5.49, 5.62, 5.76, 5.90, 6.04, 6.19, 6.34, 6.49, 6.65, 6.81, 6.98, 7.15, 7.32, 7.50, 7.68, 7.87, 8.06, 8.25, 8.45, 8.66, 8.87, 9.09, 9.31, 9.53, 9.76]
-
 # --- Helper Functions ---
 def format_resistor_value(r_value):
     if r_value is None: return "N/A"
@@ -79,11 +74,9 @@ def _get_deviation_color(perc_dev, max_dev):
 # ===========================
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-ASSET_FILES = {
-    'E12': os.path.join(ROOT_DIR, 'assets', 'rcf_e12.bin'),
-    'E24': os.path.join(ROOT_DIR, 'assets', 'rcf_e24.bin'),
-    'E96': os.path.join(ROOT_DIR, 'assets', 'rcf_e96.bin'),
-}
+ASSET_FILES = {f'E{n}': os.path.join(ROOT_DIR, 'assets', f'rcf_e{n}.bin')
+               for n in (3, 6, 12, 24, 48, 96, 192)}
+
 
 # Fixed-point scales used when generating the binaries
 R_SCALE = 10**8    # integer units per ohm for R-arrays
@@ -132,6 +125,12 @@ def load_precomp(series: str, log):
     path = ASSET_FILES.get(series)
     if not path:
         raise ValueError(f"Unknown E-series '{series}'")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Precompute file not found: {path}\n"
+            f"Generate it with precomp.py and place it under the 'assets' folder."
+        )
+
     log(f"  Opening precompute: {path}", level=1)
 
     f = open(path, 'rb')
@@ -164,7 +163,7 @@ def load_precomp(series: str, log):
     if endian_flag != 0:
         mm.close(); f.close()
         raise ValueError("Only little-endian payloads are supported (endian_flag != 0)")
-    expected_id = {'E12':12, 'E24':24, 'E96':96}[series]
+    expected_id = {'E3':3, 'E6':6, 'E12':12, 'E24':24, 'E48':48, 'E96':96, 'E192':192}[series]
     if e_series_id != expected_id:
         mm.close(); f.close()
         raise ValueError(f"E-series id mismatch: file={e_series_id}, requested {expected_id}")
@@ -248,11 +247,6 @@ def load_precomp(series: str, log):
     off,len_ = offsets["S_sum"];         H.S_sum = view_q(off, len_)
     off,len_ = offsets["S_i"];           H.S_i   = view_I(off, len_)
     off,len_ = offsets["S_j"];           H.S_j   = view_I(off, len_)
-
-    off,len_ = offsets["G_sum"];         H.G_sum = view_q(off, len_)
-    off,len_ = offsets["G_i"];           H.G_i   = view_I(off, len_)
-    off,len_ = offsets["G_j"];           H.G_j   = view_I(off, len_)
-
 
     off,len_ = offsets["G_sum"];         H.G_sum = view_q(off, len_)
     off,len_ = offsets["G_i"];           H.G_i   = view_I(off, len_)
@@ -1121,7 +1115,8 @@ class ResistorCalculatorApp(QMainWindow):
         self.deviation_entry = QLineEdit("0.1")
         control_grid_layout.addWidget(self.deviation_entry, row_num, 1, 1, 2)
         row_num += 1
-        self.disclaimer_label = QLabel("Caution: E96, E24, wide range or N=3\ncan increase calculation time significantly.")
+        self.disclaimer_label = QLabel(
+            "Caution: E48/E96/E192, wide ranges, or N=3\ncan increase calculation time significantly.")
         self.disclaimer_label.setStyleSheet("color: #FF4500;")
         default_font = QApplication.font()
         disclaimer_font = QFont(default_font.family(), int(default_font.pointSize() * 0.9) if default_font.pointSize() > 0 else 8)
@@ -1130,7 +1125,7 @@ class ResistorCalculatorApp(QMainWindow):
         row_num += 1
         control_grid_layout.addWidget(QLabel("E-Series:"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
         self.eseries_combo = QComboBox()
-        self.eseries_combo.addItems(['E12', 'E24', 'E96'])
+        self.eseries_combo.addItems(['E3', 'E6', 'E12', 'E24', 'E48', 'E96', 'E192'])
         self.eseries_combo.setCurrentText(self._default_e_series)
         control_grid_layout.addWidget(self.eseries_combo, row_num, 1, 1, 2)
         row_num += 1
