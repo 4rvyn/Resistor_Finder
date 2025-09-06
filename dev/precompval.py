@@ -1,5 +1,5 @@
 # validate_precomp.py
-# Verifies rcf_e12.bin / rcf_e24.bin / rcf_e96.bin created by precomp.py
+# Verifies rcf_e{N}.bin (N in {3,6,12,24,48,96,192}) created by precomp.py
 # - Parses header and section directory
 # - Checks 8-byte alignment, lengths, bounds
 # - Recomputes payload checksum (blake2b-64)
@@ -35,6 +35,10 @@ EXPECTED_G_SCALE_NUM = 10**12
 EXPECTED_G_SCALE_DEN = 1
 EXPECTED_DECADE_MIN = -3
 EXPECTED_DECADE_MAX = 9
+
+SUPPORTED_SERIES = {3, 6, 12, 24, 48, 96, 192}
+DECADES = EXPECTED_DECADE_MAX - EXPECTED_DECADE_MIN + 1  # should be 13
+
 
 # Section names in the exact order the payload checksum is computed
 SECTION_ORDER = [
@@ -119,7 +123,7 @@ def check_header(hdr: Dict) -> List[str]:
         errs.append(f"Unexpected version: {hdr['version']}")
     if hdr["endian_flag"] != 0:
         errs.append("Unexpected endian_flag (expected 0 for little-endian).")
-    if not (hdr["e_series_id"] in (12, 24, 96)):
+    if hdr["e_series_id"] not in SUPPORTED_SERIES:
         errs.append(f"Unexpected E-series id: {hdr['e_series_id']}")
     if hdr["decade_min"] != EXPECTED_DECADE_MIN or hdr["decade_max"] != EXPECTED_DECADE_MAX:
         errs.append(f"Unexpected decade range: {hdr['decade_min']}..{hdr['decade_max']}")
@@ -168,6 +172,22 @@ def validate_file(path: str) -> bool:
         n = hdr["n_singles"]
         mS = hdr["n_pairs_series"]
         mG = hdr["n_pairs_parallel"]
+
+        # Derived sanity checks consistent with how precomp.py writes:
+        if n % DECADES != 0:
+            fail(f"n_singles={n} not divisible by number of decades={DECADES}.")
+            return False
+
+        base_count = n // DECADES
+        if base_count != hdr["e_series_id"]:
+            fail(f"Base count derived from n_singles ({base_count}) != e_series_id ({hdr['e_series_id']}).")
+            return False
+
+        expected_pairs = n * (n + 1) // 2
+        if mS != expected_pairs or mG != expected_pairs:
+            fail(f"Pair count mismatch: expected {expected_pairs}; S={mS}, G={mG}.")
+            return False
+
 
         # Section sanity checks: alignment, bounds
         for name in SECTION_ORDER:
@@ -233,6 +253,46 @@ def validate_file(path: str) -> bool:
         G_sum = read_array(f, *sections["G_sum"], "q")
         G_i   = read_array(f, *sections["G_i"], "I")
         G_j   = read_array(f, *sections["G_j"], "I")
+
+    # === Mantissa/decade integrity ===
+    # 1) mantissa_idx range and decade range
+    for k in range(n):
+        if mi[k] >= base_count:
+            fail(f"mantissa_idx out of range at k={k}: mi={mi[k]} >= base_count={base_count}")
+            return False
+        if dk[k] < EXPECTED_DECADE_MIN or dk[k] > EXPECTED_DECADE_MAX:
+            fail(f"decade out of range at k={k}: {dk[k]}")
+            return False
+
+    # 2) R encodes m100 * 10^(decade+6) exactly (no rounding error allowed)
+    m100_per_mi = [None] * base_count
+    for k in range(n):
+        pow10 = 10 ** (dk[k] + 6)  # matches precomp.py generation
+        if pow10 == 0:
+            fail("Internal pow10 error.")
+            return False
+        if R[k] % pow10 != 0:
+            fail(f"R[{k}] not divisible by 10^(decade+6). R={R[k]} decade={dk[k]}")
+            return False
+        m100 = R[k] // pow10
+        idx = mi[k]
+        if m100_per_mi[idx] is None:
+            m100_per_mi[idx] = m100
+        elif m100_per_mi[idx] != m100:
+            fail(f"Inconsistent base mantissa*100 for mantissa_idx={idx}: "
+                f"{m100_per_mi[idx]} vs {m100}")
+            return False
+
+    # 3) Even distribution: exactly base_count singles per decade
+    counts_by_decade = {d: 0 for d in range(EXPECTED_DECADE_MIN, EXPECTED_DECADE_MAX + 1)}
+    for d in dk:
+        counts_by_decade[d] += 1
+    if any(c != base_count for c in counts_by_decade.values()):
+        fail(f"Singles not evenly distributed per decade: {counts_by_decade}")
+        return False
+
+    ok("Mantissa/decade integrity verified.")
+
 
     # === Singles checks ===
     # 1) R strictly increasing
@@ -357,8 +417,8 @@ def main(argv: List[str]) -> int:
 
     files = argv[1:]
     if not files:
-        # Try defaults if present
-        defaults = ["rcf_e12.bin", "rcf_e24.bin", "rcf_e96.bin"]
+        # Try all known outputs if present
+        defaults = [f"rcf_e{n}.bin" for n in (3, 6, 12, 24, 48, 96, 192)]
         files = [p for p in defaults if os.path.isfile(p)]
         if not files:
             print("Usage: py validate_precomp.py [files...]", file=sys.stderr)
