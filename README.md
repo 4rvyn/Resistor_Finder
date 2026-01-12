@@ -1,7 +1,7 @@
 # Resistor Combination Finder (PyQt6)
 
 *Ever tried to hit a weird target resistance and spent ages juggling E-series parts in series/parallel?*
-This app does the book-keeping for you—instantly computing either —**1**: **every** valid combo within your tolerance (**Path A**) or —**2**: the **Top-K#** closest matches (**Path B**).
+This app does the book-keeping and instantly computes either **(1)**: **every** valid combo within your tolerance (**Path A**) or **(2)**: the **Top-K#** closest matches (**Path B**).
 
 ![UI](assets/screenshot.png)
 
