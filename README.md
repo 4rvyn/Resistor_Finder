@@ -1,4 +1,4 @@
-# Resistor Combination Finder (PyQt6)
+# Resistor Combination Finder
 
 *Ever tried to hit a weird target resistance and spent ages juggling E-series parts in series/parallel?*
 This app does the book-keeping and instantly computes either **(1)**: **every** valid combo within your tolerance (**Path A**) or **(2)**: the **Top-K#** closest matches (**Path B**).
@@ -21,8 +21,8 @@ Tested on Windows 10+, Python 3.13+.
 Enter target + tolerance, choose E-series, decades, N (1–3), and topologies.
 Pick a **Compute core**:
 
-* **Path A** — exhaustive within ±tolerance (deterministic & complete).
-* **Path B** — best-first global search; returns exactly **K#**-number of best matches.
+* **Path A:** exhaustive within ±tolerance (deterministic & complete).
+* **Path B:** best-first global search; returns exactly **K#**-number of best matches.
 
 Then **Run** and (optionally) sort by **Deviation (%)** or **Config Type**.
 
@@ -55,7 +55,7 @@ flowchart LR
 
 Binary tables live in `assets/`:
 
-* `rcf_e12.bin`, `rcf_e24.bin`, `rcf_e96.bin` — sorted singles and pair sums used by both cores.
+* `rcf_e12.bin`, `rcf_e24.bin`, `rcf_e96.bin`: sorted singles and pair sums used by both cores.
 
 Regenerate / validate (optional):
 
@@ -69,4 +69,4 @@ python precompval.py
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT: see [LICENSE](LICENSE).
