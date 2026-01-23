@@ -77,43 +77,9 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSET_FILES = {f'E{n}': os.path.join(ROOT_DIR, 'assets', f'rcf_e{n}.bin')
                for n in (3, 6, 12, 24, 48, 96, 192)}
 
-
 # Fixed-point scales used when generating the binaries
 R_SCALE = 10**8    # integer units per ohm for R-arrays
 G_SCALE = 10**12   # integer units per siemens for G-arrays
-
-# Header layout used by the generator/validator we built earlier.
-# Fields (little-endian):
-#   magic[4] = b'RCF1'
-#   version  = u32 (1)
-#   nSingles = u32 (n)
-#   nPairs   = u32 (m)
-#   off_R, off_G, off_mant, off_dec, off_S_sum, off_S_i, off_S_j, off_G_sum, off_G_i, off_G_j = 10 * u64
-#   payload_crc32 = u32  (CRC of everything after the header)
-_HEADER_FMT = '<4sIII' + 'Q'*10 + 'I'
-_HEADER_SIZE = struct.calcsize(_HEADER_FMT)
-
-class Precomp:
-    __slots__ = ('path', 'n', 'm',
-                 'R', 'G', 'mant', 'dec',
-                 'S_sum', 'S_i', 'S_j',
-                 'P_sum', 'P_i', 'P_j')
-    def __init__(self): pass
-
-_PRECOMP_CACHE = {}  # keyed by series 'E12'/'E24'/'E96'
-
-def _read_array(f, off, count, code):
-    """Read a numeric array from offset using array('code')."""
-    if count == 0:
-        return array(code)
-    bps = array(code).itemsize
-    f.seek(off)
-    buf = f.read(count * bps)
-    a = array(code)
-    a.frombytes(buf)
-    if sys.byteorder != 'little':
-        a.byteswap()
-    return a
 
 def load_precomp(series: str, log):
     """
@@ -634,17 +600,12 @@ def find_resistor_combinations_topk(
 ):
     """
     Path B: Top-K best-first across all enabled topologies.
-    Uses the precomputed singles + pair tables. Produces exactly K best items
-    by absolute deviation from target_value and then stops.
-    Respects: E-series, decade range, max_components, allowed configs.
-    Guarantees: *exact global Top-K* results by true deviation; optimized for speed.
     """
     start_time = time.time()
     results = []
     accepted = 0
     uid = 0  # tie-breaker for heap stability
 
-    # dedicated logger
     def log(message, level=0):
         ts = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
         queue_func(f"[{ts}] {'  '*level}{message}")
@@ -654,287 +615,330 @@ def find_resistor_combinations_topk(
         log(f"E-Series: {selected_e_series}", 1)
         H = load_precomp(selected_e_series, log)
 
-        # Build decade filter
-        dec_lo = int(range_min_factor); dec_hi = int(range_max_factor)
+        dec_lo = int(range_min_factor)
+        dec_hi = int(range_max_factor)
         allowed = build_allowed(H.dec, dec_lo, dec_hi)
 
-        # Targets in scaled domains
-        R_t = int(round(target_value * R_SCALE))
         if target_value <= 0:
             return [], 0
-        G_t = int(round(G_SCALE / target_value))  # target conductance
 
-        log(f"Mode: Top-K (Path B) — K={k_best}", 1)
+        R_t = int(round(target_value * R_SCALE))       # target in scaled-ohms (1e8 units)
+        G_R = G_SCALE * R_SCALE                        # constant used for exact rational comparisons
+
+        log(f"Mode: Top-K (Path B) K={k_best}", 1)
         log(f"Target: {format_resistor_value(target_value)}", 1)
         log(f"Decades allowed: 10^{dec_lo} .. 10^{dec_hi}", 1)
 
-        # Global frontier (min-heap) of candidates from all streams.
-        # Each item: (abs_dev, uid, tag, data_dict)
-        # 'tag' identifies which stream type to advance when popped.
         import heapq
         Q = []
-        seen = set()  # de-dup across streams; keys are tuples
+        seen = set()
 
-        # ------------ helpers ------------
-        def abs_dev_from_R(R_ohm: float) -> float:
-            return abs(R_ohm - target_value)
+        class DevFrac:
+            __slots__ = ("num", "den")
+            def __init__(self, num: int, den: int):
+                self.num = int(num) if num >= 0 else int(-num)
+                self.den = int(den)
+            def __lt__(self, other):
+                return self.num * other.den < other.num * self.den
+            def __eq__(self, other):
+                return self.num * other.den == other.num * self.den
 
-        def emit_result(config, topology, i=None, j=None, k=None, R_ohm=None):
+        def push(dev_frac, tag, st):
+            nonlocal uid
+            heapq.heappush(Q, (dev_frac, uid, tag, st))
+            uid += 1
+
+        def emit_result(config, topology, i=None, j=None, k=None):
             nonlocal accepted
-            # Build canonical key to suppress duplicates across streams
-            if config in ("Single",):
-                key = (config, i)
+
+            if config == "Single":
+                key = ("Single", i)
+
             elif config in ("Series (2)", "Parallel (2)"):
-                a = min(i, j); b = max(i, j)
+                a = i if i <= j else j
+                b = j if i <= j else i
                 key = (config, a, b)
+
+            elif config in ("Series (3)", "Parallel (3)"):
+                t0 = i
+                t1 = j
+                t2 = k
+                if t0 > t1:
+                    t0, t1 = t1, t0
+                if t1 > t2:
+                    t1, t2 = t2, t1
+                if t0 > t1:
+                    t0, t1 = t1, t0
+                key = (config, t0, t1, t2)
+
+            elif config in ("Mixed S-P", "Mixed P-S"):
+                a = i if i <= j else j
+                b = j if i <= j else i
+                key = (config, k, a, b)
+
             else:
-                # triples/mixed: sort (i,j) pair; keep k role explicit to avoid over-aggressive collapse
-                a = min(i, j); b = max(i, j)
-                key = (config, a, b, k)
+                return False
+
             if key in seen:
                 return False
             seen.add(key)
 
-            # Compose result
             if config == "Single":
-                r1 = H.R[i] / R_SCALE; r2 = None; r3 = None
+                r1 = H.R[i] / R_SCALE
+                r2 = None
+                r3 = None
                 combined = r1
+
             elif config == "Series (2)":
-                r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE; r3 = None
+                r1 = H.R[i] / R_SCALE
+                r2 = H.R[j] / R_SCALE
+                r3 = None
                 combined = r1 + r2
+
             elif config == "Parallel (2)":
                 gsum = H.G[i] + H.G[j]
-                if gsum <= 0: return False
-                r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE; r3 = None
+                if gsum <= 0:
+                    return False
+                r1 = H.R[i] / R_SCALE
+                r2 = H.R[j] / R_SCALE
+                r3 = None
                 combined = G_SCALE / gsum
+
             elif config == "Series (3)":
-                r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE; r3 = H.R[k] / R_SCALE
+                r1 = H.R[i] / R_SCALE
+                r2 = H.R[j] / R_SCALE
+                r3 = H.R[k] / R_SCALE
                 combined = r1 + r2 + r3
+
             elif config == "Parallel (3)":
                 gsum = H.G[i] + H.G[j] + H.G[k]
-                if gsum <= 0: return False
-                r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE; r3 = H.R[k] / R_SCALE
+                if gsum <= 0:
+                    return False
+                r1 = H.R[i] / R_SCALE
+                r2 = H.R[j] / R_SCALE
+                r3 = H.R[k] / R_SCALE
                 combined = G_SCALE / gsum
+
             elif config == "Mixed S-P":
                 gsum = H.G[i] + H.G[j]
-                if gsum <= 0: return False
+                if gsum <= 0:
+                    return False
                 r_par = G_SCALE / gsum
-                r1 = H.R[k] / R_SCALE; r2 = H.R[i] / R_SCALE; r3 = H.R[j] / R_SCALE
+                r1 = H.R[k] / R_SCALE
+                r2 = H.R[i] / R_SCALE
+                r3 = H.R[j] / R_SCALE
                 combined = r1 + r_par
+
             elif config == "Mixed P-S":
                 ssum = H.R[i] + H.R[j]
-                r1 = H.R[k] / R_SCALE; s = ssum / R_SCALE
-                if r1 + s <= 0: return False
-                r2 = H.R[i] / R_SCALE; r3 = H.R[j] / R_SCALE
+                denom = H.R[k] + ssum
+                if denom <= 0:
+                    return False
+                r1 = H.R[k] / R_SCALE
+                s = ssum / R_SCALE
+                r2 = H.R[i] / R_SCALE
+                r3 = H.R[j] / R_SCALE
                 combined = (r1 * s) / (r1 + s)
+
             else:
                 return False
 
             abs_dev = abs(combined - target_value)
             perc_dev = (abs_dev / target_value) * 100.0
+
             results.append({
-                'config': config,
-                'topology': topology,
-                'r1': r1, 'r2': r2, 'r3': r3,
-                'combined_r': combined,
-                'abs_dev': abs_dev,
-                'perc_dev': perc_dev
+                "config": config,
+                "topology": topology,
+                "r1": r1,
+                "r2": r2,
+                "r3": r3,
+                "combined_r": combined,
+                "abs_dev": abs_dev,
+                "perc_dev": perc_dev
             })
             accepted += 1
             return True
 
-        def push(item):
-            # item must carry a precomputed 'abs_dev' for ordering
-            heapq.heappush(Q, item)
+        def dev_single(idx):
+            return DevFrac(abs(H.R[idx] - R_t), 1)
 
-        # ----- stream builders (each uses its own local "advance" semantics) -----
+        def dev_s2(p):
+            return DevFrac(abs(H.S_sum[p] - R_t), 1)
 
-        # Singles stream (2-sided sweep from target index)
+        def dev_p2(p):
+            gsum = H.P_sum[p]
+            if gsum <= 0:
+                return None
+            num = abs(G_R - (R_t * gsum))
+            return DevFrac(num, gsum)
+
+        def dev_s3(p, k):
+            sum_scaled = H.S_sum[p] + H.R[k]
+            return DevFrac(abs(sum_scaled - R_t), 1)
+
+        def dev_p3(p, k):
+            gsum = H.P_sum[p] + H.G[k]
+            if gsum <= 0:
+                return None
+            num = abs(G_R - (R_t * gsum))
+            return DevFrac(num, gsum)
+
+        def dev_sp(p, k):
+            gsum = H.P_sum[p]
+            if gsum <= 0:
+                return None
+            num = abs((H.R[k] * gsum + G_R) - (R_t * gsum))
+            return DevFrac(num, gsum)
+
+        def dev_ps(p, k):
+            ssum = H.S_sum[p]
+            denom = H.R[k] + ssum
+            if denom <= 0:
+                return None
+            num = abs((H.R[k] * ssum) - (R_t * denom))
+            return DevFrac(num, denom)
+
         def init_singles():
             if max_components < 1:
                 return
             pos = bisect.bisect_left(H.R, R_t)
-            for side, idx in (('L', pos-1), ('R', pos)):
-                if 0 <= idx < H.n:
-                    if not allowed[idx]:
-                        # still push; we'll skip at pop-time but advance the side
-                        pass
-                    R_ohm = H.R[idx] / R_SCALE
-                    dev = abs_dev_from_R(R_ohm)
-                    nonlocal uid
-                    push((dev, uid, 'S1', {'center': pos, 'idx': idx, 'side': side}))
-                    uid += 1
+            left = pos - 1
+            right = pos
+            if 0 <= left < H.n:
+                push(dev_single(left), "S1", {"idx": left, "side": "L"})
+            if 0 <= right < H.n:
+                push(dev_single(right), "S1", {"idx": right, "side": "R"})
 
-        def advance_singles(state):
-            center = state['center']; idx = state['idx']; side = state['side']
-            next_idx = idx-1 if side == 'L' else idx+1
-            if 0 <= next_idx < H.n:
-                R_ohm = H.R[next_idx] / R_SCALE
-                dev = abs_dev_from_R(R_ohm)
-                nonlocal uid
-                push((dev, uid, 'S1', {'center': center, 'idx': next_idx, 'side': side}))
-                uid += 1
+        def advance_singles(st):
+            idx = st["idx"]
+            side = st["side"]
+            nxt = idx - 1 if side == "L" else idx + 1
+            if 0 <= nxt < H.n:
+                push(dev_single(nxt), "S1", {"idx": nxt, "side": side})
 
-        # Pair stream template over a sorted pair-sum array
-        def init_pairs(tag, sum_arr, idx_i, idx_j, target_scaled):
+        def init_pairs(tag, sum_arr, target_scaled):
             pos = bisect.bisect_left(sum_arr, target_scaled)
-            for side, p in (('L', pos-1), ('R', pos)):
+            for side, p in (("L", pos - 1), ("R", pos)):
                 if 0 <= p < len(sum_arr):
-                    i = idx_i[p]; j = idx_j[p]
-                    # compute exact combined R in ohms for deviation
-                    if tag == 'S2':
-                        R_ohm = (sum_arr[p] / R_SCALE)
-                    else:  # 'P2' over conductance
-                        gsum = sum_arr[p]
-                        if gsum <= 0: continue
-                        R_ohm = G_SCALE / gsum
-                    dev = abs_dev_from_R(R_ohm)
-                    nonlocal uid
-                    push((dev, uid, tag, {'center': pos, 'p': p, 'side': side}))
-                    uid += 1
+                    if tag == "S2":
+                        dv = dev_s2(p)
+                    else:
+                        dv = dev_p2(p)
+                        if dv is None:
+                            continue
+                    push(dv, tag, {"p": p, "side": side})
 
-        def advance_pairs(tag, state, sum_arr):
-            center = state['center']; p = state['p']; side = state['side']
-            next_p = p-1 if side == 'L' else p+1
-            if 0 <= next_p < len(sum_arr):
-                if tag == 'S2':
-                    R_ohm = (sum_arr[next_p] / R_SCALE)
+        def advance_pairs(tag, st, sum_arr):
+            p = st["p"]
+            side = st["side"]
+            nxt = p - 1 if side == "L" else p + 1
+            if 0 <= nxt < len(sum_arr):
+                if tag == "S2":
+                    dv = dev_s2(nxt)
                 else:
-                    gsum = sum_arr[next_p]
-                    if gsum <= 0: return
-                    R_ohm = G_SCALE / gsum
-                dev = abs_dev_from_R(R_ohm)
-                nonlocal uid
-                push((dev, uid, tag, {'center': center, 'p': next_p, 'side': side}))
-                uid += 1
+                    dv = dev_p2(nxt)
+                    if dv is None:
+                        return
+                push(dv, tag, {"p": nxt, "side": side})
 
-        # Triple stream template: per-k sweep over pair sums
-        def init_triples(tag, base_arr, idx_i, idx_j, target_scaled_fn, k_indices):
-            # For each allowed k we seed two neighbors
+        def init_triples(tag, base_arr, target_scaled_fn, k_indices):
             for k in k_indices:
-                # compute target center for pair subproblem
                 t_scaled = target_scaled_fn(k)
                 if t_scaled is None:
                     continue
                 pos = bisect.bisect_left(base_arr, t_scaled)
-                for side, p in (('L', pos-1), ('R', pos)):
+                for side, p in (("L", pos - 1), ("R", pos)):
                     if 0 <= p < len(base_arr):
-                        i = idx_i[p]; j = idx_j[p]
-                        # optional symmetry pruning for S3/P3: require j <= k (emit each triple once)
-                        if tag in ('S3', 'P3') and j > k:
-                            continue
-                        # compute expected R_ohm
-                        if tag == 'S3':
-                            R_ohm = (base_arr[p] + H.R[k]) / R_SCALE
-                        elif tag == 'P3':
-                            gsum = base_arr[p] + H.G[k]
-                            if gsum <= 0: continue
-                            R_ohm = G_SCALE / gsum
-                        elif tag == 'SP':
-                            gsum = base_arr[p]
-                            if gsum <= 0: continue
-                            r_par = G_SCALE / gsum
-                            R_ohm = (H.R[k] / R_SCALE) + r_par
-                        elif tag == 'PS':
-                            ssum = base_arr[p]
-                            r1 = H.R[k] / R_SCALE
-                            s = ssum / R_SCALE
-                            if r1 + s <= 0: continue
-                            R_ohm = (r1 * s) / (r1 + s)
+                        if tag == "S3":
+                            dv = dev_s3(p, k)
+                        elif tag == "P3":
+                            dv = dev_p3(p, k)
+                            if dv is None:
+                                continue
+                        elif tag == "SP":
+                            dv = dev_sp(p, k)
+                            if dv is None:
+                                continue
+                        elif tag == "PS":
+                            dv = dev_ps(p, k)
+                            if dv is None:
+                                continue
                         else:
                             continue
-                        dev = abs_dev_from_R(R_ohm)
-                        nonlocal uid
-                        push((dev, uid, tag, {'k': k, 'center': pos, 'p': p, 'side': side}))
-                        uid += 1
+                        push(dv, tag, {"k": k, "p": p, "side": side})
 
-        def advance_triples(tag, state, base_arr):
-            k = state['k']; p = state['p']; side = state['side']
-            next_p = p-1 if side == 'L' else p+1
-            if not (0 <= next_p < len(base_arr)):
+        def advance_triples(tag, st, base_arr):
+            k = st["k"]
+            p = st["p"]
+            side = st["side"]
+            nxt = p - 1 if side == "L" else p + 1
+            if not (0 <= nxt < len(base_arr)):
                 return
-            if tag == 'S3':
-                R_ohm = (base_arr[next_p] + H.R[k]) / R_SCALE
-            elif tag == 'P3':
-                gsum = base_arr[next_p] + H.G[k]
-                if gsum <= 0: return
-                R_ohm = G_SCALE / gsum
-            elif tag == 'SP':
-                gsum = base_arr[next_p]
-                if gsum <= 0: return
-                r_par = G_SCALE / gsum
-                R_ohm = (H.R[k] / R_SCALE) + r_par
-            elif tag == 'PS':
-                ssum = base_arr[next_p]
-                r1 = H.R[k] / R_SCALE
-                s = ssum / R_SCALE
-                if r1 + s <= 0: return
-                R_ohm = (r1 * s) / (r1 + s)
+
+            if tag == "S3":
+                dv = dev_s3(nxt, k)
+            elif tag == "P3":
+                dv = dev_p3(nxt, k)
+                if dv is None:
+                    return
+            elif tag == "SP":
+                dv = dev_sp(nxt, k)
+                if dv is None:
+                    return
+            elif tag == "PS":
+                dv = dev_ps(nxt, k)
+                if dv is None:
+                    return
             else:
                 return
-            dev = abs_dev_from_R(R_ohm)
-            nonlocal uid
-            new_state = dict(state)
-            new_state['p'] = next_p
-            push((dev, uid, tag, new_state))
-            uid += 1
 
-        # ------------ seed streams ------------
+            push(dv, tag, {"k": k, "p": nxt, "side": side})
 
-        # Singles
         init_singles()
 
-        # N=2 Series
         if max_components >= 2 and series_allowed:
-            init_pairs('S2', H.S_sum, H.S_i, H.S_j, R_t)
+            init_pairs("S2", H.S_sum, R_t)
 
-        # N=2 Parallel (conductance)
         if max_components >= 2 and parallel_allowed:
-            init_pairs('P2', H.P_sum, H.P_i, H.P_j, G_t)
+            g_star_ceil = ceil_div_pos(G_R, R_t)
+            init_pairs("P2", H.P_sum, g_star_ceil)
 
-        # Pre-list of allowed single indices for per-k triple streams
         allowed_k = [k for k in range(H.n) if allowed[k]] if max_components >= 3 else []
 
-        # N=3 Series
         if max_components >= 3 and series_allowed:
             def t_scaled_S3(k):
                 return R_t - H.R[k]
-            init_triples('S3', H.S_sum, H.S_i, H.S_j, t_scaled_S3, allowed_k)
+            init_triples("S3", H.S_sum, t_scaled_S3, allowed_k)
 
-        # N=3 Parallel
         if max_components >= 3 and parallel_allowed:
             def t_scaled_P3(k):
-                return G_t - H.G[k]
-            init_triples('P3', H.P_sum, H.P_i, H.P_j, t_scaled_P3, allowed_k)
+                num = G_R - (R_t * H.G[k])
+                if num <= 0:
+                    return 0
+                return ceil_div_pos(num, R_t)
 
-        # Mixed S-P: R1 + (R2||R3)
+            init_triples("P3", H.P_sum, t_scaled_P3, allowed_k)
+
         if max_components >= 3 and mixed_allowed:
             def t_scaled_SP(k):
-                # pair target in conductance: g_target = 1 / max(ε, (T - R1))
-                r1 = H.R[k] / R_SCALE
-                denom = target_value - r1
-                if denom <= 0:
-                    return None
-                g_target = G_SCALE / denom
-                return int(round(g_target))
-            init_triples('SP', H.P_sum, H.P_i, H.P_j, t_scaled_SP, allowed_k)
+                denom_scaled = R_t - H.R[k]
+                if denom_scaled <= 0:
+                    return int(H.P_sum[-1]) + 1
+                return ceil_div_pos(G_R, denom_scaled)
 
-        # Mixed P-S: R1 || (R2+R3)
+            init_triples("SP", H.P_sum, t_scaled_SP, allowed_k)
+
         if max_components >= 3 and mixed_allowed:
             def t_scaled_PS(k):
-                # valid only if R1 > target; pair target in series sum: s_target = R_t*R1 / (R1 - R_t)
-                R1 = H.R[k]
-                if R1 <= R_t:
-                    return None
-                num = R_t * R1
-                den = (R1 - R_t)
-                if den <= 0:
-                    return None
-                # integer division rounding to nearest is fine for center; exact dev computed at pop
-                return int(num // den)
-            init_triples('PS', H.S_sum, H.S_i, H.S_j, t_scaled_PS, allowed_k)
+                Rk = H.R[k]
+                if Rk <= R_t:
+                    return int(H.S_sum[-1]) + 1
+                num = R_t * Rk
+                den = Rk - R_t
+                return ceil_div_pos(num, den)
 
-        # ------------ main pop loop ------------
+            init_triples("PS", H.S_sum, t_scaled_PS, allowed_k)
+
         total_goal = max(1, int(k_best))
         popped = 0
         last_progress_emit = -1
@@ -946,71 +950,84 @@ def find_resistor_combinations_topk(
             dev, _id, tag, st = heapq.heappop(Q)
             popped += 1
 
-            # Dispatch per-tag: verify "allowed" and emit, then advance that stream
-            if tag == 'S1':
-                idx = st['idx']
+            if tag == "S1":
+                idx = st["idx"]
                 if 0 <= idx < H.n:
                     if allowed[idx]:
                         emit_result("Single", "R1", i=idx)
                     advance_singles(st)
 
-            elif tag == 'S2':
-                p = st['p']; i = H.S_i[p]; j = H.S_j[p]
+            elif tag == "S2":
+                p = st["p"]
+                i = H.S_i[p]
+                j = H.S_j[p]
                 if allowed[i] and allowed[j]:
                     emit_result("Series (2)", "R1+R2", i=i, j=j)
-                advance_pairs('S2', st, H.S_sum)
+                advance_pairs("S2", st, H.S_sum)
 
-            elif tag == 'P2':
-                p = st['p']; i = H.P_i[p]; j = H.P_j[p]
+            elif tag == "P2":
+                p = st["p"]
+                i = H.P_i[p]
+                j = H.P_j[p]
                 if allowed[i] and allowed[j]:
                     emit_result("Parallel (2)", "R1||R2", i=i, j=j)
-                advance_pairs('P2', st, H.P_sum)
+                advance_pairs("P2", st, H.P_sum)
 
-            elif tag in ('S3','P3','SP','PS'):
-                p = st['p']; k = st['k']
-                if tag in ('S3','P3'):
-                    i = (H.S_i if tag == 'S3' else H.P_i)[p]
-                    j = (H.S_j if tag == 'S3' else H.P_j)[p]
-                elif tag == 'SP':
-                    i = H.P_i[p]; j = H.P_j[p]
-                else:  # 'PS'
-                    i = H.S_i[p]; j = H.S_j[p]
+            elif tag in ("S3", "P3", "SP", "PS"):
+                p = st["p"]
+                k = st["k"]
 
-                if allowed[i] and allowed[j] and allowed[k]:
-                    if tag == 'S3':
+                if tag == "S3":
+                    i = H.S_i[p]
+                    j = H.S_j[p]
+                    if allowed[i] and allowed[j] and allowed[k]:
                         emit_result("Series (3)", "R1+R2+R3", i=i, j=j, k=k)
-                    elif tag == 'P3':
+                    advance_triples("S3", st, H.S_sum)
+
+                elif tag == "P3":
+                    i = H.P_i[p]
+                    j = H.P_j[p]
+                    if allowed[i] and allowed[j] and allowed[k]:
                         emit_result("Parallel (3)", "R1||R2||R3", i=i, j=j, k=k)
-                    elif tag == 'SP':
+                    advance_triples("P3", st, H.P_sum)
+
+                elif tag == "SP":
+                    i = H.P_i[p]
+                    j = H.P_j[p]
+                    if allowed[i] and allowed[j] and allowed[k]:
                         emit_result("Mixed S-P", "R1+(R2||R3)", i=i, j=j, k=k)
-                    else:  # 'PS'
-                        # feasibility check for P-S: target below R1 already enforced at seeding; no extra filter
+                    advance_triples("SP", st, H.P_sum)
+
+                else:  # "PS"
+                    i = H.S_i[p]
+                    j = H.S_j[p]
+                    if allowed[i] and allowed[j] and allowed[k]:
                         emit_result("Mixed P-S", "R1||(R2+R3)", i=i, j=j, k=k)
-                advance_triples(tag, st, {'S3': H.S_sum, 'P3': H.P_sum, 'SP': H.P_sum, 'PS': H.S_sum}[tag])
+                    advance_triples("PS", st, H.S_sum)
 
-            # progress (accepted only)
-            if accepted != last_progress_emit and (accepted % max(1, total_goal//200) == 0 or accepted == total_goal):
+            if accepted != last_progress_emit and (accepted % max(1, total_goal // 200) == 0 or accepted == total_goal):
                 last_progress_emit = accepted
-                queue_func({'type':'progress', 'current': accepted, 'total': total_goal})
+                queue_func({"type": "progress", "current": accepted, "total": total_goal})
 
-        # wrap up
-        queue_func({'type':'progress', 'current': accepted, 'total': total_goal})
+        queue_func({"type": "progress", "current": accepted, "total": total_goal})
         log("[SUMMARY]")
-        log(f"Emitted {accepted} best results.", 1)
+        log(f"Emitted {accepted} best unique results.", 1)
         log(f"Popped {popped} candidates across streams.", 1)
         log(f"Total time: {time.time() - start_time:.3f} s", 1)
         return results, max(accepted, 1)
 
     except InterruptedError:
-        queue_func({'type':'progress', 'current': 1, 'total': 1, 'status':'Stopped'})
+        queue_func({"type": "progress", "current": 1, "total": 1, "status": "Stopped"})
         return None, 0
+
     except Exception as e:
-        queue_func({'type':'progress', 'current': 1, 'total': 1, 'status':'Error'})
+        queue_func({"type": "progress", "current": 1, "total": 1, "status": "Error"})
         tb = traceback.format_exc()
         log("[CALCULATION ERROR] " + str(e), 0)
         for line in tb.splitlines():
             log(line, 1)
         return None, 0
+
 
 # --- Qt Worker for Calculations ---
 class CalculationWorker(QObject):
