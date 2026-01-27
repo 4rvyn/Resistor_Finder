@@ -16,6 +16,8 @@ import math
 import os
 import struct
 from array import array
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -37,7 +39,7 @@ CONFIG_COLORS = {
     "Parallel (3)": "#FFA500", # Orange
     "Mixed S-P": "#9932CC",   # DarkOrchid
     "Mixed P-S": "#4682B4",   # SteelBlue
-    "default": "#000000"      # Black for any unexpected case
+    "default": "#000000"
 }
 
 # --- Helper Functions ---
@@ -600,6 +602,15 @@ def find_resistor_combinations_topk(
 ):
     """
     Path B: Top-K best-first across all enabled topologies.
+
+    Guarantee target:
+    - Ranking is exact with respect to the fixed-point integer target R_t (scaled-ohms).
+    - If target_value is passed as Decimal (recommended), R_t is derived exactly from it.
+    - If target_value is float, R_t is derived via round(target_value * R_SCALE).
+
+    Key invariant for Top-K correctness:
+    - Each stream enumerates candidates in nondecreasing DevFrac order by seeding at an exact pivot
+      and advancing outward.
     """
     start_time = time.time()
     results = []
@@ -611,6 +622,9 @@ def find_resistor_combinations_topk(
         queue_func(f"[{ts}] {'  '*level}{message}")
 
     try:
+        # Local import to avoid dependency on global imports if you refactor later
+        from decimal import Decimal, ROUND_HALF_UP
+
         log("[SETUP]")
         log(f"E-Series: {selected_e_series}", 1)
         H = load_precomp(selected_e_series, log)
@@ -619,17 +633,24 @@ def find_resistor_combinations_topk(
         dec_hi = int(range_max_factor)
         allowed = build_allowed(H.dec, dec_lo, dec_hi)
 
-        if target_value <= 0:
-            return [], 0
+        # Normalize target input: exact integer target for ranking + float only for display fields
+        if isinstance(target_value, Decimal):
+            if target_value <= 0:
+                return [], 0
+            target_float = float(target_value)
+            R_t = int((target_value * Decimal(R_SCALE)).to_integral_value(rounding=ROUND_HALF_UP))
+        else:
+            target_float = float(target_value)
+            if target_float <= 0:
+                return [], 0
+            R_t = int(round(target_float * R_SCALE))
 
-        R_t = int(round(target_value * R_SCALE))       # target in scaled-ohms (1e8 units)
-        G_R = G_SCALE * R_SCALE                        # constant used for exact rational comparisons
+        G_R = G_SCALE * R_SCALE  # constant used for exact rational comparisons
 
         log(f"Mode: Top-K (Path B) K={k_best}", 1)
-        log(f"Target: {format_resistor_value(target_value)}", 1)
+        log(f"Target: {format_resistor_value(target_float)}", 1)
         log(f"Decades allowed: 10^{dec_lo} .. 10^{dec_hi}", 1)
 
-        import heapq
         Q = []
         seen = set()
 
@@ -651,6 +672,7 @@ def find_resistor_combinations_topk(
         def emit_result(config, topology, i=None, j=None, k=None):
             nonlocal accepted
 
+            # Canonical keys for dedup
             if config == "Single":
                 key = ("Single", i)
 
@@ -660,9 +682,7 @@ def find_resistor_combinations_topk(
                 key = (config, a, b)
 
             elif config in ("Series (3)", "Parallel (3)"):
-                t0 = i
-                t1 = j
-                t2 = k
+                t0, t1, t2 = i, j, k
                 if t0 > t1:
                     t0, t1 = t1, t0
                 if t1 > t2:
@@ -683,6 +703,7 @@ def find_resistor_combinations_topk(
                 return False
             seen.add(key)
 
+            # Compute display values in float (ranking is done by DevFrac elsewhere)
             if config == "Single":
                 r1 = H.R[i] / R_SCALE
                 r2 = None
@@ -743,8 +764,9 @@ def find_resistor_combinations_topk(
             else:
                 return False
 
-            abs_dev = abs(combined - target_value)
-            perc_dev = (abs_dev / target_value) * 100.0
+            # use target_float here to avoid float-Decimal type errors
+            abs_dev = abs(combined - target_float)
+            perc_dev = (abs_dev / target_float) * 100.0
 
             results.append({
                 "config": config,
@@ -759,6 +781,7 @@ def find_resistor_combinations_topk(
             accepted += 1
             return True
 
+        # Exact deviation keys (for ranking) using fixed-point integers
         def dev_single(idx):
             return DevFrac(abs(H.R[idx] - R_t), 1)
 
@@ -787,6 +810,7 @@ def find_resistor_combinations_topk(
             gsum = H.P_sum[p]
             if gsum <= 0:
                 return None
+            # |(Rk + G_R/gsum) - R_t| = |Rk*gsum + G_R - R_t*gsum| / gsum
             num = abs((H.R[k] * gsum + G_R) - (R_t * gsum))
             return DevFrac(num, gsum)
 
@@ -795,9 +819,11 @@ def find_resistor_combinations_topk(
             denom = H.R[k] + ssum
             if denom <= 0:
                 return None
+            # |(Rk*ssum/(Rk+ssum)) - R_t| = |Rk*ssum - R_t*(Rk+ssum)| / (Rk+ssum)
             num = abs((H.R[k] * ssum) - (R_t * denom))
             return DevFrac(num, denom)
 
+        # Stream initializers and advancers
         def init_singles():
             if max_components < 1:
                 return
@@ -894,12 +920,14 @@ def find_resistor_combinations_topk(
 
             push(dv, tag, {"k": k, "p": nxt, "side": side})
 
+        # Seed streams
         init_singles()
 
         if max_components >= 2 and series_allowed:
             init_pairs("S2", H.S_sum, R_t)
 
         if max_components >= 2 and parallel_allowed:
+            # Exact conductance pivot: g* = G_R / R_t
             g_star_ceil = ceil_div_pos(G_R, R_t)
             init_pairs("P2", H.P_sum, g_star_ceil)
 
@@ -912,31 +940,34 @@ def find_resistor_combinations_topk(
 
         if max_components >= 3 and parallel_allowed:
             def t_scaled_P3(k):
+                # Want g_total near G_R / R_t. With g_total = H.P_sum[p] + H.G[k]
+                # Pivot for base: H.P_sum[p] near (G_R - R_t*H.G[k]) / R_t
                 num = G_R - (R_t * H.G[k])
                 if num <= 0:
                     return 0
                 return ceil_div_pos(num, R_t)
-
             init_triples("P3", H.P_sum, t_scaled_P3, allowed_k)
 
         if max_components >= 3 and mixed_allowed:
             def t_scaled_SP(k):
+                # Target: R_t approx H.R[k] + G_R / g
+                # Pivot: g* = G_R / (R_t - H.R[k])
                 denom_scaled = R_t - H.R[k]
                 if denom_scaled <= 0:
-                    return int(H.P_sum[-1]) + 1
+                    return int(H.P_sum[-1]) + 1  # seed at right edge
                 return ceil_div_pos(G_R, denom_scaled)
-
             init_triples("SP", H.P_sum, t_scaled_SP, allowed_k)
 
         if max_components >= 3 and mixed_allowed:
             def t_scaled_PS(k):
+                # Target: R_t approx (Rk*S)/(Rk+S)
+                # If Rk > R_t, pivot S* = (R_t*Rk)/(Rk-R_t), else seed at right edge
                 Rk = H.R[k]
                 if Rk <= R_t:
                     return int(H.S_sum[-1]) + 1
                 num = R_t * Rk
                 den = Rk - R_t
                 return ceil_div_pos(num, den)
-
             init_triples("PS", H.S_sum, t_scaled_PS, allowed_k)
 
         total_goal = max(1, int(k_best))
@@ -1356,6 +1387,7 @@ class ResistorCalculatorApp(QMainWindow):
         self.estimated_total_checks = 0
         self._log_gui_event("Results window cleared.")
 
+
     def start_calculation(self):
         if self.calculation_qthread and self.calculation_qthread.isRunning():
             self._log_gui_event("Calculation already in progress.")
@@ -1370,7 +1402,7 @@ class ResistorCalculatorApp(QMainWindow):
         self.current_results = []
 
         try:
-            target_val_part = float(self.target_entry.text())
+            target_text = self.target_entry.text().strip()
             target_unit = self.unit_combo.currentText()
             deviation = float(self.deviation_entry.text())
             max_comp = self.max_comp_spin.value()
@@ -1381,24 +1413,57 @@ class ResistorCalculatorApp(QMainWindow):
             parallel_allowed = self.parallel_check.isChecked()
             mixed_allowed = self.mixed_check.isChecked() and (max_comp >= 3)
 
-            if deviation < 0: raise ValueError("Deviation cannot be negative.")
-            if target_val_part <= 0: raise ValueError("Target value must be positive.")
-            if range_min > range_max: raise ValueError("Range Min cannot be greater than Range Max.")
+            if deviation < 0:
+                raise ValueError("Deviation cannot be negative.")
+            if range_min > range_max:
+                raise ValueError("Range Min cannot be greater than Range Max.")
             if not (series_allowed or parallel_allowed or mixed_allowed):
-                 raise ValueError("At least one config type must be allowed.")
+                raise ValueError("At least one config type must be allowed.")
 
             self.last_used_deviation_limit = deviation
 
-            if target_unit == f"m{OHM_SYMBOL}": target_value_ohms = target_val_part / 1000
-            elif target_unit == f"k{OHM_SYMBOL}": target_value_ohms = target_val_part * 1000
-            elif target_unit == f"M{OHM_SYMBOL}": target_value_ohms = target_val_part * 1000000
-            elif target_unit == f"G{OHM_SYMBOL}": target_value_ohms = target_val_part * 1000000000
-            else: target_value_ohms = target_val_part
-
-            # --- choose core & start worker ---
+            # Choose core mode early so we can parse target without float for Path B
             core_mode = 'A' if self.core_combo.currentIndex() == 0 else 'B'
             self._last_core_mode = core_mode  # remember for sorting behavior after finish
 
+            if core_mode == 'B':
+                # Exact decimal parsing to preserve the user's intended target (no binary float step)
+                try:
+                    target_val_dec = Decimal(target_text)
+                except InvalidOperation:
+                    raise ValueError("Target value must be a number.")
+                if target_val_dec <= 0:
+                    raise ValueError("Target value must be positive.")
+
+                if target_unit == f"m{OHM_SYMBOL}":
+                    target_value_ohms = target_val_dec / Decimal(1000)
+                elif target_unit == f"k{OHM_SYMBOL}":
+                    target_value_ohms = target_val_dec * Decimal(1000)
+                elif target_unit == f"M{OHM_SYMBOL}":
+                    target_value_ohms = target_val_dec * Decimal(1000000)
+                elif target_unit == f"G{OHM_SYMBOL}":
+                    target_value_ohms = target_val_dec * Decimal(1000000000)
+                else:
+                    target_value_ohms = target_val_dec
+
+            else:
+                # Path A stays on float math (as before)
+                target_val_part = float(target_text)
+                if target_val_part <= 0:
+                    raise ValueError("Target value must be positive.")
+
+                if target_unit == f"m{OHM_SYMBOL}":
+                    target_value_ohms = target_val_part / 1000.0
+                elif target_unit == f"k{OHM_SYMBOL}":
+                    target_value_ohms = target_val_part * 1000.0
+                elif target_unit == f"M{OHM_SYMBOL}":
+                    target_value_ohms = target_val_part * 1000000.0
+                elif target_unit == f"G{OHM_SYMBOL}":
+                    target_value_ohms = target_val_part * 1000000000.0
+                else:
+                    target_value_ohms = target_val_part
+
+            # --- start worker ---
             self._update_button_states(is_running=True)
             self.calculation_qthread = QThread()
 
@@ -1432,6 +1497,7 @@ class ResistorCalculatorApp(QMainWindow):
             self._log_gui_event(traceback.format_exc())
             self.progress_label.setText("GUI Error")
             self._update_button_states(is_running=False)
+
 
     def _on_thread_actually_finished(self):
         self.calculation_qthread = None
