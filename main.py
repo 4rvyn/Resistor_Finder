@@ -12,12 +12,9 @@ import heapq
 import bisect
 import traceback
 import mmap
-import math
 import os
 import struct
-from array import array
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -52,16 +49,6 @@ def format_resistor_value(r_value):
     if abs_r >= 1_000:         return f"{r_value / 1_000:.3f} k{OHM_SYMBOL}"
     if abs_r < 1 and abs_r > 1e-4: return f"{r_value * 1000:.3f} m{OHM_SYMBOL}"
     return f"{r_value:.3f} {OHM_SYMBOL}"
-
-def parallel_calc(*resistors):
-    inv_sum = 0
-    for r in resistors:
-        if r is None or r <= 0: return float('inf')
-        try:
-            inv_sum += 1.0 / r
-        except ZeroDivisionError: return float('inf')
-    if inv_sum == 0: return float('inf')
-    return 1.0 / inv_sum
 
 def _get_deviation_color(perc_dev, max_dev):
     if max_dev <= 0: max_dev = 1
@@ -156,9 +143,6 @@ def load_precomp(series: str, log):
         ln  = pairs_vals[2*i+1]
         offsets[nm] = (off, ln)
 
-    # payload checksum
-    checksum = struct.unpack_from("<Q", mm, pairs_off + pairs_size)[0]
-
     # Helper to create typed memoryviews (no copies)
     mv = memoryview(mm)
 
@@ -239,21 +223,14 @@ def load_precomp(series: str, log):
 def ceil_div_pos(a, b):  # a,b > 0
     return (a + b - 1) // b
 
-def band_on_sorted(arr, lo, hi):
-    """Return [l, r) indices such that lo <= arr[idx] <= hi; arr is nondecreasing."""
-    l = bisect.bisect_left(arr, lo)
-    r = bisect.bisect_right(arr, hi)
-    if r < l: r = l
-    return l, r
-
 def build_allowed(dec_arr, dec_lo, dec_hi):
     """Boolean mask of singles allowed by decade range inclusive."""
     return [ (dec_lo <= d <= dec_hi) for d in dec_arr ]
 
-# --- Core Calculation Logic: CORE A ---
-def find_resistor_combinations(
+
+# --- Calculation Logic: Best-first search ---
+def find_resistor_combinations_bestfirst(
     target_value,
-    allowed_deviation_percent,
     max_components,
     selected_e_series,
     range_min_factor,
@@ -261,356 +238,22 @@ def find_resistor_combinations(
     series_allowed,
     parallel_allowed,
     mixed_allowed,
+    search_mode,     # "topk" or "tolerance"
+    mode_value,      # int for topk, Decimal for tolerance (%)
     stop_event,
     queue_func
 ):
     """
-    Path A: Complete enumeration within a specified tolerance band.
-    Uses the precomputed singles + pair tables to exhaustively generate
-    every valid resistor combination that falls within ±allowed_deviation_percent
-    of target_value.
-    Respects: E-series, decade range, component count, and configuration options.
-    Guarantees: full coverage across tolerance band.
-    """
-    start_time = time.time()
-    results = []
+    Unified best-first search.
 
-    # dedicated logger
-    def log(message, level=0):
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        indent = "  " * level
-        queue_func(f"[{timestamp}] {indent}{message}")
+    Modes:
+      - "topk": emit the best K unique results (by absolute error in scaled-ohms)
+      - "tolerance": emit ALL unique results with percent deviation <= mode_value
 
-    try:
-        # ================
-        # LOAD PRECOMPUTE
-        # ================
-        log("[SETUP]")
-        log(f"E-Series: {selected_e_series}", 1)
-        H = load_precomp(selected_e_series, log)
-
-        # Build decade filter
-        dec_lo = int(range_min_factor); dec_hi = int(range_max_factor)
-        allowed = build_allowed(H.dec, dec_lo, dec_hi)
-
-        # Convert UI target & tolerance → integer bands
-        tol = allowed_deviation_percent / 100.0
-        T_min = target_value * (1.0 - tol)
-        T_max = target_value * (1.0 + tol)
-
-        # Scaled bands
-        R_min = int(math.ceil(T_min * R_SCALE))
-        R_max = int(math.floor(T_max * R_SCALE))
-        # For parallel: conductance band  [G_min, G_max]
-        if T_max <= 0 or T_min <= 0:
-            return [], 0
-        G_min = int(math.ceil(G_SCALE / T_max))
-        G_max = int(math.floor(G_SCALE / T_min))
-
-        log(f"Target: {format_resistor_value(target_value)}", 1)
-        log(f"Tolerance: {allowed_deviation_percent:.6f}%", 1)
-        log(f"Decades allowed: 10^{dec_lo} .. 10^{dec_hi}", 1)
-
-        # progress bookkeeping (rough but monotone)
-        total_steps = 1
-        steps_done = 0
-        def bump(n=1):
-            nonlocal steps_done
-            steps_done += n
-            if steps_done % 200 == 0:
-                queue_func({'type':'progress', 'current': steps_done, 'total': max(total_steps, steps_done)})
-
-        # Small helpers to emit results
-        def emit_single(k):
-            r1 = H.R[k] / R_SCALE
-            combined = r1
-            abs_dev = abs(combined - target_value)
-            perc_dev = (abs_dev / target_value) * 100.0
-            results.append({
-                'config': 'Single',
-                'topology': 'R1',
-                'r1': r1, 'r2': None, 'r3': None,
-                'combined_r': combined,
-                'abs_dev': abs_dev,
-                'perc_dev': perc_dev
-            })
-
-        def emit_series2(i,j):
-            r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE
-            combined = r1 + r2
-            abs_dev = abs(combined - target_value)
-            perc_dev = (abs_dev / target_value) * 100.0
-            results.append({
-                'config': 'Series (2)', 'topology': 'R1+R2',
-                'r1': r1, 'r2': r2, 'r3': None,
-                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
-            })
-
-        def emit_parallel2(i,j):
-            gsum = H.G[i] + H.G[j]
-            if gsum <= 0: return
-            combined = (G_SCALE / gsum)
-            r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE
-            abs_dev = abs(combined - target_value)
-            perc_dev = (abs_dev / target_value) * 100.0
-            results.append({
-                'config': 'Parallel (2)', 'topology': 'R1||R2',
-                'r1': r1, 'r2': r2, 'r3': None,
-                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
-            })
-
-        def emit_series3(i,j,k):
-            r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE; r3 = H.R[k] / R_SCALE
-            combined = r1 + r2 + r3
-            abs_dev = abs(combined - target_value)
-            perc_dev = (abs_dev / target_value) * 100.0
-            results.append({
-                'config': 'Series (3)', 'topology': 'R1+R2+R3',
-                'r1': r1, 'r2': r2, 'r3': r3,
-                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
-            })
-
-        def emit_parallel3(i,j,k):
-            gsum = H.G[i] + H.G[j] + H.G[k]
-            if gsum <= 0: return
-            combined = (G_SCALE / gsum)
-            r1 = H.R[i] / R_SCALE; r2 = H.R[j] / R_SCALE; r3 = H.R[k] / R_SCALE
-            abs_dev = abs(combined - target_value)
-            perc_dev = (abs_dev / target_value) * 100.0
-            results.append({
-                'config': 'Parallel (3)', 'topology': 'R1||R2||R3',
-                'r1': r1, 'r2': r2, 'r3': r3,
-                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
-            })
-
-        def emit_mixed_SP(i,j,k):
-            # R1 + (R2||R3)
-            gsum = H.G[i] + H.G[j]
-            if gsum <= 0: return
-            r_par = (G_SCALE / gsum)
-            r1 = H.R[k] / R_SCALE
-            combined = r1 + r_par
-            r2 = H.R[i] / R_SCALE; r3 = H.R[j] / R_SCALE
-            abs_dev = abs(combined - target_value)
-            perc_dev = (abs_dev / target_value) * 100.0
-            results.append({
-                'config': 'Mixed S-P', 'topology': 'R1+(R2||R3)',
-                'r1': r1, 'r2': r2, 'r3': r3,
-                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
-            })
-
-        def emit_mixed_PS(i,j,k):
-            # R1 || (R2+R3)
-            ssum = H.R[i] + H.R[j]
-            denom = (H.R[k] + ssum)
-            if denom <= 0: return
-            # compute in float for display
-            r1 = H.R[k] / R_SCALE; s = ssum / R_SCALE
-            combined = (r1 * s) / (r1 + s)
-            r2 = H.R[i] / R_SCALE; r3 = H.R[j] / R_SCALE
-            abs_dev = abs(combined - target_value)
-            perc_dev = (abs_dev / target_value) * 100.0
-            results.append({
-                'config': 'Mixed P-S', 'topology': 'R1||(R2+R3)',
-                'r1': r1, 'r2': r2, 'r3': r3,
-                'combined_r': combined, 'abs_dev': abs_dev, 'perc_dev': perc_dev
-            })
-
-        # ==========================
-        # N=1 (band on singles R[])
-        # ==========================
-        log("[SEARCHING]", 0)
-        if max_components >= 1:
-            l, r = band_on_sorted(H.R, R_min, R_max)
-            total_steps += (r - l)
-            log(f"Singles band: {r-l} candidates", 1)
-            for k in range(l, r):
-                if stop_event.is_set(): raise InterruptedError()
-                if allowed[k]:
-                    emit_single(k)
-                bump()
-
-        # ==========================
-        # N=2 (Series / Parallel)
-        # ==========================
-        if max_components >= 2:
-            if series_allowed:
-                l, r = band_on_sorted(H.S_sum, R_min, R_max)
-                total_steps += (r - l)
-                log(f"Series(2) band: {r-l} pairs", 1)
-                for idx in range(l, r):
-                    if stop_event.is_set(): raise InterruptedError()
-                    i = H.S_i[idx]; j = H.S_j[idx]
-                    if allowed[i] and allowed[j]:
-                        emit_series2(i, j)
-                    bump()
-
-            if parallel_allowed:
-                l, r = band_on_sorted(H.P_sum, G_min, G_max)
-                total_steps += (r - l)
-                log(f"Parallel(2) band: {r-l} pairs", 1)
-                for idx in range(l, r):
-                    if stop_event.is_set(): raise InterruptedError()
-                    i = H.P_i[idx]; j = H.P_j[idx]
-                    if allowed[i] and allowed[j]:
-                        emit_parallel2(i, j)
-                    bump()
-
-        # ==========================================
-        # N=3 (Series, Parallel, Mixed S-P, Mixed P-S)
-        # ==========================================
-        if max_components >= 3:
-            # Precompute list of allowed singles to loop outer k
-            allowed_indices = [k for k in range(H.n) if allowed[k]]
-
-            if series_allowed:
-                log("Series(3): scanning per-k windows over S_sum ...", 1)
-                for k in allowed_indices:
-                    if stop_event.is_set(): raise InterruptedError()
-                    Rk = H.R[k]
-                    lo = R_min - Rk
-                    hi = R_max - Rk
-                    if hi < lo: 
-                        continue
-                    l, r = band_on_sorted(H.S_sum, lo, hi)
-                    total_steps += (r - l)
-                    for idx in range(l, r):
-                        i = H.S_i[idx]; j = H.S_j[idx]
-                        # de-dup: ensure the outer k is >= j (emit each unordered triple once)
-                        if not (allowed[i] and allowed[j]): 
-                            continue
-                        if j > k:
-                            continue
-                        emit_series3(i, j, k)
-                    bump()
-
-            if parallel_allowed:
-                log("Parallel(3): scanning per-k windows over P_sum ...", 1)
-                for k in allowed_indices:
-                    if stop_event.is_set(): raise InterruptedError()
-                    Gk = H.G[k]
-                    lo = G_min - Gk
-                    hi = G_max - Gk
-                    if hi < lo:
-                        continue
-                    l, r = band_on_sorted(H.P_sum, lo, hi)
-                    total_steps += (r - l)
-                    for idx in range(l, r):
-                        i = H.P_i[idx]; j = H.P_j[idx]
-                        if not (allowed[i] and allowed[j]):
-                            continue
-                        if j > k:
-                            continue
-                        emit_parallel3(i, j, k)
-                    bump()
-
-            if mixed_allowed:
-                # Mixed S-P : R1 + (R2||R3)  → for each R1 use a G_sum window derived from R-band
-                log("Mixed S-P: per-k G_sum windows derived from R-band ...", 1)
-                for k in allowed_indices:
-                    if stop_event.is_set(): raise InterruptedError()
-                    r1_ohm = H.R[k] / R_SCALE
-                    # Desired parallel branch must satisfy: r_par ∈ [T_min - r1, T_max - r1]
-                    tp_min_ohm = T_min - r1_ohm
-                    tp_max_ohm = T_max - r1_ohm
-                    # If the parallel part must be positive, clip the lower bound slightly above 0
-                    if tp_max_ohm <= 0:
-                        continue
-                    if tp_min_ohm <= 0:
-                        tp_min_ohm = 1e-12  # avoid div-by-zero; any tiny positive number is fine
-
-                    # Convert resistance window → conductance window in pS
-                    gL = int(math.ceil(G_SCALE / tp_max_ohm))   # lower conductance bound
-                    gU = int(math.floor(G_SCALE / tp_min_ohm))  # upper conductance bound
-                    if gU < gL:
-                        continue
-
-                    l, r = band_on_sorted(H.P_sum, gL, gU)
-
-                    total_steps += (r - l)
-                    for idx in range(l, r):
-                        i = H.P_i[idx]; j = H.P_j[idx]
-                        if allowed[i] and allowed[j]:
-                            emit_mixed_SP(i, j, k)
-                    bump()
-
-                # Mixed P-S : R1 || (R2+R3)  → feasible only if R1 > R_max
-                log("Mixed P-S: per-k S_sum windows derived from parallel algebra ...", 1)
-                for k in allowed_indices:
-                    if stop_event.is_set(): raise InterruptedError()
-                    R1 = H.R[k]
-                    if R1 <= R_max:
-                        continue
-                    # S in [S_min, S_max] where:
-                    # S_min = ceil( R_min*R1 / (R1 - R_min) )
-                    # S_max = floor( R_max*R1 / (R1 - R_max) )
-                    # All integer in R_SCALE domain:
-                    S_min_num = R_min * R1
-                    S_min_den = (R1 - R_min)
-                    if S_min_den <= 0:
-                        continue
-                    S_min = ceil_div_pos(S_min_num, S_min_den)
-
-                    S_max_num = R_max * R1
-                    S_max_den = (R1 - R_max)
-                    if S_max_den <= 0:
-                        continue
-                    S_max = S_max_num // S_max_den
-
-                    if S_max < S_min:
-                        continue
-                    l, r = band_on_sorted(H.S_sum, S_min, S_max)
-                    total_steps += (r - l)
-                    for idx in range(l, r):
-                        i = H.S_i[idx]; j = H.S_j[idx]
-                        if allowed[i] and allowed[j]:
-                            emit_mixed_PS(i, j, k)
-                    bump()
-
-        # wrap up
-        queue_func({'type':'progress', 'current': steps_done, 'total': max(total_steps, steps_done)})
-        log("[SUMMARY]")
-        log(f"Found {len(results)} combinations within tolerance.", 1)
-        log(f"Total time: {time.time() - start_time:.3f} s", 1)
-        return results, max(total_steps, steps_done)
-
-    except InterruptedError:
-        queue_func({'type':'progress', 'current': 1, 'total': 1, 'status':'Stopped'})
-        return None, 0
-    except Exception as e:
-        queue_func({'type':'progress', 'current': 1, 'total': 1, 'status':'Error'})
-        tb = traceback.format_exc()
-        log("[CALCULATION ERROR] " + str(e), 0)
-        for line in tb.splitlines():
-            log(line, 1)
-        return None, 0
-
-# --- Core Calculation Logic: CORE B ---
-def find_resistor_combinations_topk(
-    target_value,
-    _unused_allowed_deviation_percent,
-    max_components,
-    selected_e_series,
-    range_min_factor,
-    range_max_factor,
-    series_allowed,
-    parallel_allowed,
-    mixed_allowed,
-    k_best,
-    stop_event,
-    queue_func
-):
-    """
-    Path B: Top-K best-first across all enabled topologies.
-
-    Guarantee target:
-    - Ranking is exact with respect to the fixed-point integer target R_t (scaled-ohms).
-    - If target_value is passed as Decimal (recommended), R_t is derived exactly from it.
-    - If target_value is float, R_t is derived via round(target_value * R_SCALE).
-
-    Key invariant for Top-K correctness:
-    - Each stream enumerates candidates in nondecreasing DevFrac order by seeding at an exact pivot
-      and advancing outward.
+    Completeness for tolerance mode relies on the stream invariant:
+      - Each stream is enumerated in nondecreasing absolute error (scaled-ohms),
+        seeded at an exact pivot and advanced outward
+      - stop only when the minimum frontier error exceeds the tolerance threshold
     """
     start_time = time.time()
     results = []
@@ -622,9 +265,6 @@ def find_resistor_combinations_topk(
         queue_func(f"[{ts}] {'  '*level}{message}")
 
     try:
-        # Local import to avoid dependency on global imports if you refactor later
-        from decimal import Decimal, ROUND_HALF_UP
-
         log("[SETUP]")
         log(f"E-Series: {selected_e_series}", 1)
         H = load_precomp(selected_e_series, log)
@@ -647,7 +287,39 @@ def find_resistor_combinations_topk(
 
         G_R = G_SCALE * R_SCALE  # constant used for exact rational comparisons
 
-        log(f"Mode: Top-K (Path B) K={k_best}", 1)
+        # Mode config
+        mode = str(search_mode).strip().lower()
+        if mode not in ("topk", "tolerance"):
+            raise ValueError(f"Unknown search_mode '{search_mode}' (expected 'topk' or 'tolerance').")
+
+        total_goal = None
+        tol_percent_dec = None
+
+        # For integer-only tolerance comparisons:
+        # abs_diff_scaled <= (tol_percent/100) * R_t
+        # abs_diff_scaled = dev.num / dev.den
+        # dev.num * 100 <= tol_percent * R_t * dev.den
+        # represent tol_percent as tol_int / P_SCALE
+        P_SCALE = 10**6
+        tol_int = None
+
+        if mode == "topk":
+            total_goal = max(1, int(mode_value))
+            log(f"Mode: Top-K, K={total_goal}", 1)
+
+        else:
+            if isinstance(mode_value, Decimal):
+                tol_percent_dec = mode_value
+            else:
+                try:
+                    tol_percent_dec = Decimal(str(mode_value))
+                except InvalidOperation:
+                    raise ValueError("Tolerance mode requires a numeric percent value.")
+            if tol_percent_dec < 0:
+                raise ValueError("Tolerance (%) cannot be negative.")
+            tol_int = int((tol_percent_dec * Decimal(P_SCALE)).to_integral_value(rounding=ROUND_HALF_UP))
+            log(f"Mode: Tolerance, band=±{tol_percent_dec}%", 1)
+
         log(f"Target: {format_resistor_value(target_float)}", 1)
         log(f"Decades allowed: 10^{dec_lo} .. 10^{dec_hi}", 1)
 
@@ -668,6 +340,18 @@ def find_resistor_combinations_topk(
             nonlocal uid
             heapq.heappush(Q, (dev_frac, uid, tag, st))
             uid += 1
+
+        def dev_exceeds_tolerance(dev: DevFrac) -> bool:
+            # dev.num/dev.den > (tol_percent/100)*R_t
+            # dev.num * 100 * P_SCALE > tol_int * R_t * dev.den
+            lhs = dev.num * 100 * P_SCALE
+            rhs = tol_int * R_t * dev.den
+            return lhs > rhs
+
+        def dev_within_tolerance(dev: DevFrac) -> bool:
+            lhs = dev.num * 100 * P_SCALE
+            rhs = tol_int * R_t * dev.den
+            return lhs <= rhs
 
         def emit_result(config, topology, i=None, j=None, k=None):
             nonlocal accepted
@@ -703,7 +387,7 @@ def find_resistor_combinations_topk(
                 return False
             seen.add(key)
 
-            # Compute display values in float (ranking is done by DevFrac elsewhere)
+            # Compute display values in float (ranking uses DevFrac elsewhere)
             if config == "Single":
                 r1 = H.R[i] / R_SCALE
                 r2 = None
@@ -764,7 +448,6 @@ def find_resistor_combinations_topk(
             else:
                 return False
 
-            # use target_float here to avoid float-Decimal type errors
             abs_dev = abs(combined - target_float)
             perc_dev = (abs_dev / target_float) * 100.0
 
@@ -781,7 +464,7 @@ def find_resistor_combinations_topk(
             accepted += 1
             return True
 
-        # Exact deviation keys (for ranking) using fixed-point integers
+        # Exact deviation keys (absolute error in scaled-ohms) using fixed-point integers
         def dev_single(idx):
             return DevFrac(abs(H.R[idx] - R_t), 1)
 
@@ -927,7 +610,6 @@ def find_resistor_combinations_topk(
             init_pairs("S2", H.S_sum, R_t)
 
         if max_components >= 2 and parallel_allowed:
-            # Exact conductance pivot: g* = G_R / R_t
             g_star_ceil = ceil_div_pos(G_R, R_t)
             init_pairs("P2", H.P_sum, g_star_ceil)
 
@@ -940,8 +622,6 @@ def find_resistor_combinations_topk(
 
         if max_components >= 3 and parallel_allowed:
             def t_scaled_P3(k):
-                # Want g_total near G_R / R_t. With g_total = H.P_sum[p] + H.G[k]
-                # Pivot for base: H.P_sum[p] near (G_R - R_t*H.G[k]) / R_t
                 num = G_R - (R_t * H.G[k])
                 if num <= 0:
                     return 0
@@ -950,18 +630,14 @@ def find_resistor_combinations_topk(
 
         if max_components >= 3 and mixed_allowed:
             def t_scaled_SP(k):
-                # Target: R_t approx H.R[k] + G_R / g
-                # Pivot: g* = G_R / (R_t - H.R[k])
                 denom_scaled = R_t - H.R[k]
                 if denom_scaled <= 0:
-                    return int(H.P_sum[-1]) + 1  # seed at right edge
+                    return int(H.P_sum[-1]) + 1
                 return ceil_div_pos(G_R, denom_scaled)
             init_triples("SP", H.P_sum, t_scaled_SP, allowed_k)
 
         if max_components >= 3 and mixed_allowed:
             def t_scaled_PS(k):
-                # Target: R_t approx (Rk*S)/(Rk+S)
-                # If Rk > R_t, pivot S* = (R_t*Rk)/(Rk-R_t), else seed at right edge
                 Rk = H.R[k]
                 if Rk <= R_t:
                     return int(H.S_sum[-1]) + 1
@@ -970,13 +646,19 @@ def find_resistor_combinations_topk(
                 return ceil_div_pos(num, den)
             init_triples("PS", H.S_sum, t_scaled_PS, allowed_k)
 
-        total_goal = max(1, int(k_best))
         popped = 0
         last_progress_emit = -1
 
-        while Q and accepted < total_goal:
+        # Run
+        while Q and (mode != "topk" or accepted < total_goal):
             if stop_event.is_set():
                 raise InterruptedError()
+
+            # Tolerance mode: stop when the best frontier candidate exceeds threshold
+            if mode == "tolerance":
+                best_dev = Q[0][0]
+                if dev_exceeds_tolerance(best_dev):
+                    break
 
             dev, _id, tag, st = heapq.heappop(Q)
             popped += 1
@@ -985,7 +667,8 @@ def find_resistor_combinations_topk(
                 idx = st["idx"]
                 if 0 <= idx < H.n:
                     if allowed[idx]:
-                        emit_result("Single", "R1", i=idx)
+                        if mode == "topk" or dev_within_tolerance(dev):
+                            emit_result("Single", "R1", i=idx)
                     advance_singles(st)
 
             elif tag == "S2":
@@ -993,7 +676,8 @@ def find_resistor_combinations_topk(
                 i = H.S_i[p]
                 j = H.S_j[p]
                 if allowed[i] and allowed[j]:
-                    emit_result("Series (2)", "R1+R2", i=i, j=j)
+                    if mode == "topk" or dev_within_tolerance(dev):
+                        emit_result("Series (2)", "R1+R2", i=i, j=j)
                 advance_pairs("S2", st, H.S_sum)
 
             elif tag == "P2":
@@ -1001,7 +685,8 @@ def find_resistor_combinations_topk(
                 i = H.P_i[p]
                 j = H.P_j[p]
                 if allowed[i] and allowed[j]:
-                    emit_result("Parallel (2)", "R1||R2", i=i, j=j)
+                    if mode == "topk" or dev_within_tolerance(dev):
+                        emit_result("Parallel (2)", "R1||R2", i=i, j=j)
                 advance_pairs("P2", st, H.P_sum)
 
             elif tag in ("S3", "P3", "SP", "PS"):
@@ -1012,40 +697,57 @@ def find_resistor_combinations_topk(
                     i = H.S_i[p]
                     j = H.S_j[p]
                     if allowed[i] and allowed[j] and allowed[k]:
-                        emit_result("Series (3)", "R1+R2+R3", i=i, j=j, k=k)
+                        if mode == "topk" or dev_within_tolerance(dev):
+                            emit_result("Series (3)", "R1+R2+R3", i=i, j=j, k=k)
                     advance_triples("S3", st, H.S_sum)
 
                 elif tag == "P3":
                     i = H.P_i[p]
                     j = H.P_j[p]
                     if allowed[i] and allowed[j] and allowed[k]:
-                        emit_result("Parallel (3)", "R1||R2||R3", i=i, j=j, k=k)
+                        if mode == "topk" or dev_within_tolerance(dev):
+                            emit_result("Parallel (3)", "R1||R2||R3", i=i, j=j, k=k)
                     advance_triples("P3", st, H.P_sum)
 
                 elif tag == "SP":
                     i = H.P_i[p]
                     j = H.P_j[p]
                     if allowed[i] and allowed[j] and allowed[k]:
-                        emit_result("Mixed S-P", "R1+(R2||R3)", i=i, j=j, k=k)
+                        if mode == "topk" or dev_within_tolerance(dev):
+                            emit_result("Mixed S-P", "R1+(R2||R3)", i=i, j=j, k=k)
                     advance_triples("SP", st, H.P_sum)
 
                 else:  # "PS"
                     i = H.S_i[p]
                     j = H.S_j[p]
                     if allowed[i] and allowed[j] and allowed[k]:
-                        emit_result("Mixed P-S", "R1||(R2+R3)", i=i, j=j, k=k)
+                        if mode == "topk" or dev_within_tolerance(dev):
+                            emit_result("Mixed P-S", "R1||(R2+R3)", i=i, j=j, k=k)
                     advance_triples("PS", st, H.S_sum)
 
-            if accepted != last_progress_emit and (accepted % max(1, total_goal // 200) == 0 or accepted == total_goal):
-                last_progress_emit = accepted
-                queue_func({"type": "progress", "current": accepted, "total": total_goal})
+            # Progress
+            if mode == "topk":
+                if accepted != last_progress_emit and (accepted % max(1, total_goal // 200) == 0 or accepted == total_goal):
+                    last_progress_emit = accepted
+                    queue_func({"type": "progress", "current": accepted, "total": total_goal})
+            else:
+                if accepted != last_progress_emit and (accepted % 200 == 0 or (popped % 5000 == 0)):
+                    last_progress_emit = accepted
+                    queue_func({"type": "progress", "current": 0, "total": 0, "status": f"Found {accepted} (scanned {popped})"})
 
-        queue_func({"type": "progress", "current": accepted, "total": total_goal})
+        # Final progress marker
+        if mode == "topk":
+            queue_func({"type": "progress", "current": accepted, "total": total_goal})
+        else:
+            queue_func({"type": "progress", "current": accepted, "total": max(accepted, 1)})
+
         log("[SUMMARY]")
         log(f"Emitted {accepted} best unique results.", 1)
         log(f"Popped {popped} candidates across streams.", 1)
         log(f"Total time: {time.time() - start_time:.3f} s", 1)
-        return results, max(accepted, 1)
+
+        total_checks = total_goal if mode == "topk" else max(accepted, 1)
+        return results, total_checks
 
     except InterruptedError:
         queue_func({"type": "progress", "current": 1, "total": 1, "status": "Stopped"})
@@ -1066,14 +768,17 @@ class CalculationWorker(QObject):
     text_output_signal = pyqtSignal(str)
     calculation_finished_signal = pyqtSignal(object, int)
 
-    def __init__(self, core_mode, *calc_args):
+    def __init__(self, *calc_args):
         """
-        core_mode: 'A' (complete-to-tolerance) or 'B' (Top-K).
-        For 'A': args = (target, dev, maxN, series, range_min, range_max, allow_series, allow_parallel, allow_mixed)
-        For 'B': same args + k_best (inserted before the StopEvent & queue adapter).
+        calc_args (GUI-side, excluding stop_event + queue_func):
+          (target_value_ohms, maxN, e_series, range_min, range_max,
+           allow_series, allow_parallel, allow_mixed,
+           search_mode, mode_value)
+
+        search_mode: "topk" or "tolerance"
+        mode_value: int (Top-K) or Decimal (tolerance percent)
         """
         super().__init__()
-        self.core_mode = core_mode
         self.args_for_calc_func = calc_args
 
     def run_calculation(self):
@@ -1091,17 +796,11 @@ class CalculationWorker(QObject):
             else:
                 self.text_output_signal.emit(str(message))
 
-        if self.core_mode == 'A':
-            args = list(self.args_for_calc_func)
-            args.append(StopEventChecker())
-            args.append(qt_queue_func_adapter)
-            results, total_checks = find_resistor_combinations(*args)
-        else:
-            args = list(self.args_for_calc_func)
-            args.append(StopEventChecker())
-            args.append(qt_queue_func_adapter)
-            results, total_checks = find_resistor_combinations_topk(*args)
+        args = list(self.args_for_calc_func)
+        args.append(StopEventChecker())
+        args.append(qt_queue_func_adapter)
 
+        results, total_checks = find_resistor_combinations_bestfirst(*args)
         self.calculation_finished_signal.emit(results, total_checks)
 
 
@@ -1109,7 +808,7 @@ class CalculationWorker(QObject):
 class ResistorCalculatorApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Resistor Combination Finder")
+        self.setWindowTitle("Resistor Combination Finder")
         self.setGeometry(100, 100, 1300, 800)
 
         self.central_widget = QWidget()
@@ -1118,15 +817,19 @@ class ResistorCalculatorApp(QMainWindow):
 
         self.calculation_qthread = None
         self.worker = None
+
         self.current_results = []
-        self.last_used_deviation_limit = 0.1
+        self.last_used_deviation_limit = 1.0
         self.estimated_total_checks = 0
         self.help_dialog = None
-        self._last_core_mode = 'A'
+
+        # Remember last search mode for display behavior
+        self._last_search_mode = "topk"
+        self._last_mode_value = 50
 
         # --- Default control values ---
         self._default_max_components = 3
-        self._default_e_series = 'E12'
+        self._default_e_series = "E12"
         self._default_range_min = -3
         self._default_range_max = 7
         self._default_series_allowed = True
@@ -1136,157 +839,205 @@ class ResistorCalculatorApp(QMainWindow):
         self._setup_ui()
         self._connect_signals()
 
+
     def _setup_ui(self):
         top_part_widget = QWidget()
         top_part_layout = QHBoxLayout(top_part_widget)
         top_part_layout.setContentsMargins(0, 0, 0, 0)
+
         self.control_widget = QWidget()
         control_main_v_layout = QVBoxLayout(self.control_widget)
         control_grid_layout = QGridLayout()
         control_main_v_layout.addLayout(control_grid_layout)
+
         self.output_widget = QWidget()
         self.output_layout = QVBoxLayout(self.output_widget)
+
         top_part_layout.addWidget(self.control_widget, 0)
         top_part_layout.addWidget(self.output_widget, 1)
         self.control_widget.setMaximumWidth(270)
         self.main_layout.addWidget(top_part_widget, 1)
+
         row_num = 0
+
+        # Target
         control_grid_layout.addWidget(QLabel("Target Value:"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
         self.target_entry = QLineEdit("866")
         control_grid_layout.addWidget(self.target_entry, row_num, 1)
+
         self.unit_combo = QComboBox()
         self.unit_combo.addItems([f"m{OHM_SYMBOL}", f"{OHM_SYMBOL}", f"k{OHM_SYMBOL}", f"M{OHM_SYMBOL}", f"G{OHM_SYMBOL}"])
         self.unit_combo.setCurrentText(f"k{OHM_SYMBOL}")
         control_grid_layout.addWidget(self.unit_combo, row_num, 2)
         row_num += 1
-        control_grid_layout.addWidget(QLabel("Max Deviation (%):"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
-        self.deviation_entry = QLineEdit("0.1")
-        control_grid_layout.addWidget(self.deviation_entry, row_num, 1, 1, 2)
+
+        # Search mode + single shared field
+        control_grid_layout.addWidget(QLabel("Search Mode:"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
+        self.search_mode_combo = QComboBox()
+        self.search_mode_combo.addItems(["Top-K", "Tolerance (±%)"])
+        self.search_mode_combo.setCurrentIndex(0)  # default: Top-K
+        control_grid_layout.addWidget(self.search_mode_combo, row_num, 1, 1, 2)
         row_num += 1
+
+        self.mode_value_label = QLabel("Top-K (N results):")
+        control_grid_layout.addWidget(self.mode_value_label, row_num, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.mode_value_entry = QLineEdit("50")  # default: Top-K N=50
+        control_grid_layout.addWidget(self.mode_value_entry, row_num, 1, 1, 2)
+        row_num += 1
+
+        # Disclaimer
         self.disclaimer_label = QLabel(
-            "Caution: E48/E96/E192, wide ranges, or N=3\ncan increase calculation time significantly.")
+            "Caution: E48/E96/E192, wide ranges, or N=3\ncan increase calculation time significantly."
+        )
         self.disclaimer_label.setStyleSheet("color: #FF4500;")
         default_font = QApplication.font()
-        disclaimer_font = QFont(default_font.family(), int(default_font.pointSize() * 0.9) if default_font.pointSize() > 0 else 8)
+        disclaimer_font = QFont(
+            default_font.family(),
+            int(default_font.pointSize() * 0.9) if default_font.pointSize() > 0 else 8
+        )
         self.disclaimer_label.setFont(disclaimer_font)
         control_grid_layout.addWidget(self.disclaimer_label, row_num, 0, 1, 3)
         row_num += 1
+
+        # E-series
         control_grid_layout.addWidget(QLabel("E-Series:"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
         self.eseries_combo = QComboBox()
-        self.eseries_combo.addItems(['E3', 'E6', 'E12', 'E24', 'E48', 'E96', 'E192'])
+        self.eseries_combo.addItems(["E3", "E6", "E12", "E24", "E48", "E96", "E192"])
         self.eseries_combo.setCurrentText(self._default_e_series)
         control_grid_layout.addWidget(self.eseries_combo, row_num, 1, 1, 2)
         row_num += 1
 
-        # --- Core selection & Top-K ---
-        control_grid_layout.addWidget(QLabel("Core:"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
-        self.core_combo = QComboBox()
-        self.core_combo.addItems(["Complete (Path A)", "Top-K (Path B)"])
-        control_grid_layout.addWidget(self.core_combo, row_num, 1, 1, 2)
-        row_num += 1
-
-        control_grid_layout.addWidget(QLabel("Top-K:"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
-        self.kbest_spin = QSpinBox()
-        self.kbest_spin.setRange(1, 10000)
-        self.kbest_spin.setValue(50)
-        control_grid_layout.addWidget(self.kbest_spin, row_num, 1, 1, 2)
-        row_num += 1
-
+        # N, range
         control_grid_layout.addWidget(QLabel("Max Components (N):"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
         self.max_comp_spin = QSpinBox()
         self.max_comp_spin.setRange(1, 3)
         self.max_comp_spin.setValue(self._default_max_components)
         control_grid_layout.addWidget(self.max_comp_spin, row_num, 1, 1, 2)
         row_num += 1
+
         control_grid_layout.addWidget(QLabel("Range Min (10^):"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
         self.range_min_spin = QSpinBox()
         self.range_min_spin.setRange(-3, 9)
         self.range_min_spin.setValue(self._default_range_min)
         control_grid_layout.addWidget(self.range_min_spin, row_num, 1, 1, 2)
         row_num += 1
+
         control_grid_layout.addWidget(QLabel("Range Max (10^):"), row_num, 0, Qt.AlignmentFlag.AlignLeft)
         self.range_max_spin = QSpinBox()
         self.range_max_spin.setRange(-3, 9)
         self.range_max_spin.setValue(self._default_range_max)
         control_grid_layout.addWidget(self.range_max_spin, row_num, 1, 1, 2)
         row_num += 1
+
         separator1 = QFrame()
         separator1.setFrameShape(QFrame.Shape.HLine)
         separator1.setFrameShadow(QFrame.Shadow.Sunken)
         control_grid_layout.addWidget(separator1, row_num, 0, 1, 3)
         row_num += 1
+
+        # Allowed configurations
         control_grid_layout.addWidget(QLabel("Allowed Configurations:"), row_num, 0, 1, 3, Qt.AlignmentFlag.AlignLeft)
         row_num += 1
+
         self.series_check = QCheckBox("Series (N=2, N=3)")
         self.series_check.setChecked(self._default_series_allowed)
         control_grid_layout.addWidget(self.series_check, row_num, 0, 1, 3)
         row_num += 1
+
         self.parallel_check = QCheckBox("Parallel (N=2, N=3)")
         self.parallel_check.setChecked(self._default_parallel_allowed)
         control_grid_layout.addWidget(self.parallel_check, row_num, 0, 1, 3)
         row_num += 1
+
         self.mixed_check = QCheckBox("Mixed (N=3 Only)")
         self.mixed_check.setChecked(self._default_mixed_allowed)
         control_grid_layout.addWidget(self.mixed_check, row_num, 0, 1, 3)
-        self._update_mixed_check_state()
         row_num += 1
+
+        self._update_mixed_check_state()
+        self._update_search_mode_ui()
+
+        # Buttons
         button_container = QWidget()
         button_box_layout = QHBoxLayout(button_container)
-        button_box_layout.setContentsMargins(0,0,0,0)
-        self.run_button = QPushButton("Run"); self.run_button.setFixedWidth(80)
+        button_box_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.run_button = QPushButton("Run")
+        self.run_button.setFixedWidth(80)
         button_box_layout.addWidget(self.run_button)
-        self.stop_button = QPushButton("Stop"); self.stop_button.setFixedWidth(80)
+
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setFixedWidth(80)
         self.stop_button.setEnabled(False)
         button_box_layout.addWidget(self.stop_button)
-        self.clear_button = QPushButton("Clear"); self.clear_button.setFixedWidth(80)
+
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.setFixedWidth(80)
         button_box_layout.addWidget(self.clear_button)
+
         button_box_layout.addStretch(1)
         control_grid_layout.addWidget(button_container, row_num, 0, 1, 3)
         row_num += 1
+
+        # Sort group
         sort_group_box = QGroupBox("Sort Results By")
         sort_layout = QHBoxLayout()
+
         self.sort_dev_button = QPushButton("Deviation (%)")
         self.sort_dev_button.setEnabled(False)
         sort_layout.addWidget(self.sort_dev_button)
+
         self.sort_config_button = QPushButton("Config Type")
         self.sort_config_button.setEnabled(False)
         sort_layout.addWidget(self.sort_config_button)
+
         sort_group_box.setLayout(sort_layout)
         control_grid_layout.addWidget(sort_group_box, row_num, 0, 1, 3)
         row_num += 1
 
         control_grid_layout.setRowStretch(row_num, 1)
         control_main_v_layout.addStretch(1)
+
+        # Help
         self.help_button = QPushButton("Help?")
         self.help_button.setFixedWidth(80)
         help_button_layout = QHBoxLayout()
         help_button_layout.addWidget(self.help_button)
         help_button_layout.addStretch(1)
         control_main_v_layout.addLayout(help_button_layout)
+
+        # Output area
         self.output_layout.addWidget(QLabel("Results:"))
+
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
         self.output_text.setFont(QFont("Courier New", 9))
         self.output_text.setMinimumWidth(700)
         self.output_layout.addWidget(self.output_text, 1)
+
         self.progress_label = QLabel("")
         self.progress_label.setFont(QFont("Courier New", 9))
         self.output_layout.addWidget(self.progress_label)
+
+        # Log console
         log_group_box = QGroupBox("Calculation Log")
         log_group_box.setCheckable(True)
         log_group_box.setChecked(False)
+
         log_layout = QVBoxLayout(log_group_box)
         log_layout.setContentsMargins(5, 5, 5, 5)
+
         self.log_console = QTextEdit()
         self.log_console.setReadOnly(True)
         self.log_console.setFont(QFont("Courier New", 9))
         self.log_console.setVisible(False)
+
         log_group_box.toggled.connect(self.log_console.setVisible)
         log_layout.addWidget(self.log_console)
+
         self.main_layout.addWidget(log_group_box, 0)
-        
-        # Initialize core-specific enable/disable
-        self._update_core_ui()
+
 
     def _connect_signals(self):
         self.run_button.clicked.connect(self.start_calculation)
@@ -1296,7 +1047,9 @@ class ResistorCalculatorApp(QMainWindow):
         self.sort_config_button.clicked.connect(lambda: self.sort_by_config(display_message=True))
         self.help_button.clicked.connect(self.show_help_window)
         self.max_comp_spin.valueChanged.connect(self._update_mixed_check_state)
-        self.core_combo.currentIndexChanged.connect(self._on_core_changed)
+
+        self.search_mode_combo.currentIndexChanged.connect(self._on_search_mode_changed)
+
 
     def _update_mixed_check_state(self):
         is_n_less_than_3 = self.max_comp_spin.value() < 3
@@ -1304,35 +1057,56 @@ class ResistorCalculatorApp(QMainWindow):
         if is_n_less_than_3:
             self.mixed_check.setChecked(False)
 
-    def _on_core_changed(self, idx):
-        self._update_core_ui()
 
-    def _update_core_ui(self):
-        path_b = (self.core_combo.currentIndex() == 1)
-        # In Path B, tolerance is not used; Top-K is used
-        self.deviation_entry.setEnabled(not path_b)
-        self.kbest_spin.setEnabled(path_b)
+    def _on_search_mode_changed(self, idx):
+        self._update_search_mode_ui()
+
+    def _update_search_mode_ui(self):
+        topk_mode = (self.search_mode_combo.currentIndex() == 0)
+
+        current_text = self.mode_value_entry.text().strip()
+
+        if topk_mode:
+            self.mode_value_label.setText("Top-K (N results):")
+            # If the field is empty or looks like the tolerance default, reset to Top-K default.
+            if current_text == "" or current_text == "1" or current_text == "1.0":
+                self.mode_value_entry.setText("50")
+        else:
+            self.mode_value_label.setText("Max Deviation (%):")
+            # If the field is empty or looks like the Top-K default, reset to tolerance default.
+            if current_text == "" or current_text == "50":
+                self.mode_value_entry.setText("1")
+
 
     def _update_button_states(self, is_running):
         widgets_to_disable_during_run = [
-            self.target_entry, self.deviation_entry, self.max_comp_spin,
-            self.range_min_spin, self.range_max_spin, self.series_check,
-            self.parallel_check, self.mixed_check,
-            self.unit_combo, self.eseries_combo,
+            self.target_entry,
+            self.max_comp_spin,
+            self.range_min_spin,
+            self.range_max_spin,
+            self.series_check,
+            self.parallel_check,
+            self.mixed_check,
+            self.unit_combo,
+            self.eseries_combo,
             self.help_button,
-            self.core_combo,
-            self.kbest_spin,
+
+            self.search_mode_combo,
+            self.mode_value_entry,
         ]
         self.run_button.setEnabled(not is_running)
         self.stop_button.setEnabled(is_running)
         self.clear_button.setEnabled(not is_running)
-        for widget in widgets_to_disable_during_run: widget.setEnabled(not is_running)
+        for widget in widgets_to_disable_during_run:
+            widget.setEnabled(not is_running)
+
         if not is_running:
             self._update_mixed_check_state()
             self._update_sort_button_state()
         else:
             self.sort_dev_button.setEnabled(False)
             self.sort_config_button.setEnabled(False)
+
 
     def _update_sort_button_state(self):
         calculation_running = self.calculation_qthread and self.calculation_qthread.isRunning()
@@ -1404,7 +1178,7 @@ class ResistorCalculatorApp(QMainWindow):
         try:
             target_text = self.target_entry.text().strip()
             target_unit = self.unit_combo.currentText()
-            deviation = float(self.deviation_entry.text())
+
             max_comp = self.max_comp_spin.value()
             e_series = self.eseries_combo.currentText()
             range_min = self.range_min_spin.value()
@@ -1413,70 +1187,79 @@ class ResistorCalculatorApp(QMainWindow):
             parallel_allowed = self.parallel_check.isChecked()
             mixed_allowed = self.mixed_check.isChecked() and (max_comp >= 3)
 
-            if deviation < 0:
-                raise ValueError("Deviation cannot be negative.")
             if range_min > range_max:
                 raise ValueError("Range Min cannot be greater than Range Max.")
             if not (series_allowed or parallel_allowed or mixed_allowed):
                 raise ValueError("At least one config type must be allowed.")
 
-            self.last_used_deviation_limit = deviation
+            # Parse target as Decimal always (single backend now)
+            try:
+                target_val_dec = Decimal(target_text)
+            except InvalidOperation:
+                raise ValueError("Target value must be a number.")
+            if target_val_dec <= 0:
+                raise ValueError("Target value must be positive.")
 
-            # Choose core mode early so we can parse target without float for Path B
-            core_mode = 'A' if self.core_combo.currentIndex() == 0 else 'B'
-            self._last_core_mode = core_mode  # remember for sorting behavior after finish
+            if target_unit == f"m{OHM_SYMBOL}":
+                target_value_ohms = target_val_dec / Decimal(1000)
+            elif target_unit == f"k{OHM_SYMBOL}":
+                target_value_ohms = target_val_dec * Decimal(1000)
+            elif target_unit == f"M{OHM_SYMBOL}":
+                target_value_ohms = target_val_dec * Decimal(1000000)
+            elif target_unit == f"G{OHM_SYMBOL}":
+                target_value_ohms = target_val_dec * Decimal(1000000000)
+            else:
+                target_value_ohms = target_val_dec
 
-            if core_mode == 'B':
-                # Exact decimal parsing to preserve the user's intended target (no binary float step)
+            # Search mode + single entry field
+            mode_text = self.mode_value_entry.text().strip()
+            topk_mode = (self.search_mode_combo.currentIndex() == 0)
+
+            if topk_mode:
                 try:
-                    target_val_dec = Decimal(target_text)
-                except InvalidOperation:
-                    raise ValueError("Target value must be a number.")
-                if target_val_dec <= 0:
-                    raise ValueError("Target value must be positive.")
-
-                if target_unit == f"m{OHM_SYMBOL}":
-                    target_value_ohms = target_val_dec / Decimal(1000)
-                elif target_unit == f"k{OHM_SYMBOL}":
-                    target_value_ohms = target_val_dec * Decimal(1000)
-                elif target_unit == f"M{OHM_SYMBOL}":
-                    target_value_ohms = target_val_dec * Decimal(1000000)
-                elif target_unit == f"G{OHM_SYMBOL}":
-                    target_value_ohms = target_val_dec * Decimal(1000000000)
-                else:
-                    target_value_ohms = target_val_dec
+                    k_best = int(mode_text)
+                except Exception:
+                    raise ValueError("Top-K value must be an integer.")
+                if k_best < 1:
+                    raise ValueError("Top-K must be at least 1.")
+                if k_best > 10000:
+                    raise ValueError("Top-K cannot exceed 10000.")
+                search_mode = "topk"
+                mode_value = k_best
+                self._last_search_mode = "topk"
+                self._last_mode_value = k_best
 
             else:
-                # Path A stays on float math (as before)
-                target_val_part = float(target_text)
-                if target_val_part <= 0:
-                    raise ValueError("Target value must be positive.")
-
-                if target_unit == f"m{OHM_SYMBOL}":
-                    target_value_ohms = target_val_part / 1000.0
-                elif target_unit == f"k{OHM_SYMBOL}":
-                    target_value_ohms = target_val_part * 1000.0
-                elif target_unit == f"M{OHM_SYMBOL}":
-                    target_value_ohms = target_val_part * 1000000.0
-                elif target_unit == f"G{OHM_SYMBOL}":
-                    target_value_ohms = target_val_part * 1000000000.0
-                else:
-                    target_value_ohms = target_val_part
+                try:
+                    dev_percent = Decimal(mode_text)
+                except InvalidOperation:
+                    raise ValueError("Deviation (%) must be a number.")
+                if dev_percent < 0:
+                    raise ValueError("Deviation cannot be negative.")
+                search_mode = "tolerance"
+                mode_value = dev_percent
+                self._last_search_mode = "tolerance"
+                self._last_mode_value = dev_percent
+                self.last_used_deviation_limit = float(dev_percent) if dev_percent > 0 else 1.0
 
             # --- start worker ---
             self._update_button_states(is_running=True)
             self.calculation_qthread = QThread()
 
-            base_args = (
-                target_value_ohms, deviation, max_comp, e_series, range_min,
-                range_max, series_allowed, parallel_allowed, mixed_allowed
+            calc_args = (
+                target_value_ohms,
+                max_comp,
+                e_series,
+                range_min,
+                range_max,
+                series_allowed,
+                parallel_allowed,
+                mixed_allowed,
+                search_mode,
+                mode_value,
             )
 
-            if core_mode == 'A':
-                self.worker = CalculationWorker('A', *base_args)
-            else:
-                k_best = self.kbest_spin.value()
-                self.worker = CalculationWorker('B', *base_args, k_best)
+            self.worker = CalculationWorker(*calc_args)
 
             self.worker.moveToThread(self.calculation_qthread)
             self.worker.text_output_signal.connect(self.append_text_to_output)
@@ -1506,19 +1289,39 @@ class ResistorCalculatorApp(QMainWindow):
 
     def _calculation_finished_slot(self, results, total_checks_from_worker):
         self.estimated_total_checks = total_checks_from_worker
+
         if results is not None:
             self.current_results = results
-            if getattr(self, '_last_core_mode', 'A') == 'B':
-                self.sort_by_deviation(display_message=False)
+
+            # Always sort by deviation for both Top-K and tolerance band
+            self.sort_by_deviation(display_message=False)
+
+            # Color scaling:
+            # - tolerance mode: use the user band
+            # - topk mode: scale to max deviation in the emitted set (fallback 1.0)
+            if getattr(self, "_last_search_mode", "topk") == "tolerance":
+                try:
+                    v = float(self._last_mode_value)
+                    self.last_used_deviation_limit = v if v > 0 else 1.0
+                except Exception:
+                    self.last_used_deviation_limit = 1.0
             else:
-                self.sort_by_config(display_message=False)
+                if self.current_results:
+                    mx = max((x.get("perc_dev", 0.0) for x in self.current_results), default=0.0)
+                    self.last_used_deviation_limit = mx if mx > 0 else 1.0
+                else:
+                    self.last_used_deviation_limit = 1.0
 
             self.append_text_to_output("__DISPLAY_RESULTS__")
             self._log_gui_event(f"Calculation finished. {len(self.current_results)} total combinations found.")
         else:
             self.current_results = []
-        if self.calculation_qthread: self.calculation_qthread.quit()
-        else: self._update_button_states(is_running=False)
+
+        if self.calculation_qthread:
+            self.calculation_qthread.quit()
+        else:
+            self._update_button_states(is_running=False)
+
 
     def stop_calculation(self):
         if self.calculation_qthread and self.calculation_qthread.isRunning():
